@@ -51,6 +51,8 @@
     "*://*.aliexpress.com/*",
     "*://*.aliexpress.us/*",
     "https://api-sg.aliexpress.com/*",
-    "https://api.aliexpress.com/*"
+    "https://api.aliexpress.com/*",
+    "https://smart-shopper-proxy.fislilouiza91.workers.dev/*",
+    "https://cold-art-c5df.fislilouiza91.workers.dev/*"
   ]
 }
