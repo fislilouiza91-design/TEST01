@@ -1,7 +1,8 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v22)
+   Smart Shopper — Content Script (v23)
    Sends product directly to Neon DB via Cloudflare Worker
    (smart-shopper-proxy — نفس الـ Worker الخاص بـ API).
+   + يرسل حقول إضافية: image, rating, sold, discount.
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -14,7 +15,7 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v22 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v23 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
@@ -56,7 +57,11 @@
         url: product.url,
         title: product.title || "",
         price: product.price,
-        currency: product.currency || "USD"
+        currency: product.currency || "USD",
+        image: product.image || null,
+        rating: product.rating || null,
+        sold: product.sold || null,
+        discount: product.discount || null
       })
     })
     .then(() => console.log("✅ [Smart Shopper] تم إرسال المنتج إلى Neon."))
@@ -1038,5 +1043,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v22 ready.`);
+  console.log(`[Smart Shopper] v23 ready.`);
 })();
