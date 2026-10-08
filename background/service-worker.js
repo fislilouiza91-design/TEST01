@@ -1,7 +1,8 @@
 /* ═══════════════════════════════════════════════════════
    Smart Shopper — Background Service Worker
    Holds the last detected product per tab.
-   + Sends detected products to Neon DB (via Cloudflare Worker).
+   + Sends detected products to Neon DB via Cloudflare Worker.
+   Using no-cors mode to bypass CORS preflight.
    ═══════════════════════════════════════════════════════ */
 
 const tabProducts = new Map(); // tabId -> product
@@ -13,18 +14,16 @@ const DB_WORKER_URL = "https://cold-art-c5df.fisilouiza91.workers.dev/product";
 let lastSentUrl = "";
 
 /* ═══════════════════════════════════════════════════════
-   ⭐ إرسال بيانات المنتج إلى قاعدة بيانات Neon
+   ⭐ إرسال بيانات المنتج إلى قاعدة بيانات Neon (no-cors)
    ═══════════════════════════════════════════════════════ */
 async function sendProductToDB(product) {
   if (!product || !product.url) return;
 
-  // لا نرسل منتجات بدون سعر
   if (!product.price || product.price <= 0) {
     console.log("[Smart Shopper] تم تخطي الإرسال: السعر غير متوفر.");
     return;
   }
 
-  // لا نرسل نفس المنتج مرتين على التوالي
   if (product.url === lastSentUrl) {
     console.log("[Smart Shopper] المنتج نفسه أُرسل مسبقاً، تم التخطي.");
     return;
@@ -33,9 +32,10 @@ async function sendProductToDB(product) {
   lastSentUrl = product.url;
 
   try {
-    const response = await fetch(DB_WORKER_URL, {
+    await fetch(DB_WORKER_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
       body: JSON.stringify({
         url: product.url,
         title: product.title || "",
@@ -44,10 +44,10 @@ async function sendProductToDB(product) {
       })
     });
 
-    const result = await response.json();
-    console.log("✅ [Smart Shopper] تم حفظ المنتج في Neon:", result);
+    // ملاحظة: في وضع no-cors لا يمكن قراءة الاستجابة، لذا نتأكد فقط من عدم وجود خطأ
+    console.log("✅ [Smart Shopper] تم إرسال المنتج إلى Neon (no-cors).");
   } catch (error) {
-    console.error("❌ [Smart Shopper] فشل حفظ المنتج في قاعدة البيانات:", error);
+    console.error("❌ [Smart Shopper] فشل إرسال المنتج:", error);
   }
 }
 
@@ -73,12 +73,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
 
-        // Cached
         if (tabProducts.has(tab.id)) {
           return sendResponse({ ok: true, product: tabProducts.get(tab.id) });
         }
 
-        // Ask content script
         try {
           const res = await chrome.tabs.sendMessage(tab.id, { type: "GET_PRODUCT" });
           if (res?.ok) {
