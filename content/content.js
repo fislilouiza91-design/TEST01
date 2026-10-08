@@ -1,8 +1,6 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v23)
-   Sends product directly to Neon DB via Cloudflare Worker
-   (smart-shopper-proxy — نفس الـ Worker الخاص بـ API).
-   + يرسل حقول إضافية: image, rating, sold, discount.
+   Smart Shopper — Content Script (v24)
+   Sends main product + similar products to Neon DB.
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -15,11 +13,12 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v23 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v24 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
   const DB_WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/product";
+  const DB_SIMILAR_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/similar";
   const CACHE_TTL = 1000 * 60 * 30;
 
   let currentProduct = null;
@@ -29,9 +28,10 @@
   let dataSource = "none";
   let isScanning = false;
   let lastSentUrl = "";
+  let lastSentSimilar = "";
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ SEND PRODUCT TO NEON DB
+  // ⭐ SEND MAIN PRODUCT TO NEON DB
   // ═══════════════════════════════════════════════════════
 
   function sendProductToDB(product) {
@@ -41,14 +41,12 @@
 
     lastSentUrl = product.url;
 
-    // إشعار الـ Service Worker (للتخزين المؤقت في tabProducts)
     try {
       chrome.runtime.sendMessage({ type: "PRODUCT_DETECTED", product }, () => {
         if (chrome.runtime.lastError) { /* ignore */ }
       });
     } catch (_) {}
 
-    // إرسال مباشر إلى Cloudflare Worker
     fetch(DB_WORKER_URL, {
       method: "POST",
       mode: "no-cors",
@@ -61,11 +59,47 @@
         image: product.image || null,
         rating: product.rating || null,
         sold: product.sold || null,
-        discount: product.discount || null
+        discount: null
       })
     })
-    .then(() => console.log("✅ [Smart Shopper] تم إرسال المنتج إلى Neon."))
-    .catch(err => console.error("❌ [Smart Shopper] فشل الإرسال:", err));
+    .then(() => console.log("✅ [Smart Shopper] تم إرسال المنتج الرئيسي إلى Neon."))
+    .catch(err => console.error("❌ [Smart Shopper] فشل إرسال المنتج الرئيسي:", err));
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // ⭐ SEND SIMILAR PRODUCTS TO NEON DB
+  // ═══════════════════════════════════════════════════════
+
+  function sendSimilarToDB(parentUrl, similarList) {
+    if (!parentUrl || !Array.isArray(similarList) || similarList.length === 0) return;
+    if (parentUrl === lastSentSimilar) return;
+
+    lastSentSimilar = parentUrl;
+
+    const payload = similarList.map(s => ({
+      parent_url: parentUrl,
+      seller_title: s.store || "",
+      product_url: s.link || "",
+      price: s.price || 0,
+      old_price: s.oldPrice || 0,
+      discount: s.discount || 0,
+      rating: s.rating || 0,
+      sold_count: s.sold || 0,
+      image_url: s.img || "",
+      match_count: s.matchCount || 0
+    }));
+
+    fetch(DB_SIMILAR_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({
+        parent_url: parentUrl,
+        items: payload
+      })
+    })
+    .then(() => console.log(`✅ [Smart Shopper] تم إرسال ${payload.length} منتج مشابه إلى Neon.`))
+    .catch(err => console.error("❌ [Smart Shopper] فشل إرسال المنتجات المشابهة:", err));
   }
 
   // ═══════════════════════════════════════════════════════
@@ -809,6 +843,11 @@
       dataSource = result.source;
       updateSourceLabel();
       renderList();
+
+      // ⭐ إرسال المنتجات المشابهة إلى Neon
+      if (sellers.length > 0) {
+        sendSimilarToDB(currentProduct.url, sellers);
+      }
     } catch (e) {
       console.error("[Smart Shopper] Scan failed:", e);
       sellers = [];
@@ -1011,7 +1050,7 @@
     console.log("[Smart Shopper] Product:", currentProduct);
     if (!currentProduct.title || currentProduct.title.length < 5) return;
 
-    // ⭐ إرسال المنتج إلى Neon
+    // ⭐ إرسال المنتج الرئيسي إلى Neon
     sendProductToDB(currentProduct);
 
     buildPanel();
@@ -1043,5 +1082,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v23 ready.`);
+  console.log(`[Smart Shopper] v24 ready.`);
 })();
