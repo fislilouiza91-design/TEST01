@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════
    Smart Shopper — Content Script (v22)
-   Sends product directly to Neon DB via Cloudflare Worker.
-   Bypasses Service Worker to avoid Norton/VPN blocking.
+   Sends product directly to Neon DB via Cloudflare Worker
+   (smart-shopper-proxy — نفس الـ Worker الخاص بـ API).
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -18,7 +18,7 @@
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
-  const DB_WORKER_URL = "https://cold-art-c5df.fisilouiza91.workers.dev/product";
+  const DB_WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/product";
   const CACHE_TTL = 1000 * 60 * 30;
 
   let currentProduct = null;
@@ -30,7 +30,7 @@
   let lastSentUrl = "";
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ إرسال المنتج مباشرة إلى Neon
+  // ⭐ SEND PRODUCT TO NEON DB
   // ═══════════════════════════════════════════════════════
 
   function sendProductToDB(product) {
@@ -40,14 +40,14 @@
 
     lastSentUrl = product.url;
 
-    // إرسال إلى Service Worker (للتخزين المؤقت)
+    // إشعار الـ Service Worker (للتخزين المؤقت في tabProducts)
     try {
       chrome.runtime.sendMessage({ type: "PRODUCT_DETECTED", product }, () => {
         if (chrome.runtime.lastError) { /* ignore */ }
       });
     } catch (_) {}
 
-    // ⭐ إرسال مباشر إلى Cloudflare Worker (يتجاوز قيود Norton/VPN)
+    // إرسال مباشر إلى Cloudflare Worker
     fetch(DB_WORKER_URL, {
       method: "POST",
       mode: "no-cors",
