@@ -1,6 +1,7 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v21)
+   Smart Shopper — Content Script (v21.1)
    Fixed: coupon skip + class-based price + stricter filter.
+   Added: send detected product to service worker → Neon DB.
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -13,7 +14,7 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v21 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v21.1 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
@@ -25,6 +26,32 @@
   let minimized = false;
   let dataSource = "none";
   let isScanning = false;
+
+  // ═══════════════════════════════════════════════════════
+  // ⭐ SEND PRODUCT TO SERVICE WORKER → NEON DB
+  // ═══════════════════════════════════════════════════════
+
+  function sendProductToServiceWorker(product) {
+    if (!product || !product.url) return;
+    if (!product.price || product.price <= 0) return;
+
+    try {
+      chrome.runtime.sendMessage(
+        { type: "PRODUCT_DETECTED", product },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            console.warn("[Smart Shopper] Service worker غير متاح:", chrome.runtime.lastError.message);
+            return;
+          }
+          if (response && response.ok) {
+            console.log("✅ [Smart Shopper] تم إرسال المنتج إلى Service Worker.");
+          }
+        }
+      );
+    } catch (e) {
+      console.warn("[Smart Shopper] فشل إرسال المنتج:", e);
+    }
+  }
 
   // ═══════════════════════════════════════════════════════
   // CACHE
@@ -881,7 +908,7 @@
       <div class="ss-skeleton-row">
         <div class="ss-sk ss-sk-rank"></div>
         <div class="ss-sk ss-sk-thumb"></div>
-        <div class="ss-sk-lines">
+        <div class="ss-sk ss-sk-lines">
           <div class="ss-sk ss-sk-line" style="width:75%"></div>
           <div class="ss-sk ss-sk-line" style="width:45%"></div>
         </div>
@@ -1042,6 +1069,10 @@
     currentProduct = extractProduct();
     console.log("[Smart Shopper] Product:", currentProduct);
     if (!currentProduct.title || currentProduct.title.length < 5) return;
+
+    // ⭐ إرسال المنتج إلى الـ Service Worker (يخزنه في Neon)
+    sendProductToServiceWorker(currentProduct);
+
     buildPanel();
     await doScan(false);
   }
@@ -1054,6 +1085,22 @@
     }
   });
 
+  // ⭐ مراقبة تغيّر الرابط (AliExpress تطبيق SPA) لإرسال المنتج الجديد
+  let lastUrl = location.href;
+  new MutationObserver(() => {
+    const url = location.href;
+    if (url !== lastUrl) {
+      lastUrl = url;
+      setTimeout(() => {
+        const product = extractProduct();
+        if (product.title && product.title.length > 5) {
+          currentProduct = product;
+          sendProductToServiceWorker(product);
+        }
+      }, 3000);
+    }
+  }).observe(document, { subtree: true, childList: true });
+
   run();
-  console.log(`[Smart Shopper] v21 ready.`);
+  console.log(`[Smart Shopper] v21.1 ready.`);
 })();
