@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v21.1)
-   Fixed: coupon skip + class-based price + stricter filter.
-   Added: send detected product to service worker → Neon DB.
+   Smart Shopper — Content Script (v22)
+   Sends product directly to Neon DB via Cloudflare Worker.
+   Bypasses Service Worker to avoid Norton/VPN blocking.
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -14,10 +14,11 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v21.1 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v22 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
+  const DB_WORKER_URL = "https://cold-art-c5df.fisilouiza91.workers.dev/product";
   const CACHE_TTL = 1000 * 60 * 30;
 
   let currentProduct = null;
@@ -26,31 +27,40 @@
   let minimized = false;
   let dataSource = "none";
   let isScanning = false;
+  let lastSentUrl = "";
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ SEND PRODUCT TO SERVICE WORKER → NEON DB
+  // ⭐ إرسال المنتج مباشرة إلى Neon
   // ═══════════════════════════════════════════════════════
 
-  function sendProductToServiceWorker(product) {
+  function sendProductToDB(product) {
     if (!product || !product.url) return;
     if (!product.price || product.price <= 0) return;
+    if (product.url === lastSentUrl) return;
 
+    lastSentUrl = product.url;
+
+    // إرسال إلى Service Worker (للتخزين المؤقت)
     try {
-      chrome.runtime.sendMessage(
-        { type: "PRODUCT_DETECTED", product },
-        (response) => {
-          if (chrome.runtime.lastError) {
-            console.warn("[Smart Shopper] Service worker غير متاح:", chrome.runtime.lastError.message);
-            return;
-          }
-          if (response && response.ok) {
-            console.log("✅ [Smart Shopper] تم إرسال المنتج إلى Service Worker.");
-          }
-        }
-      );
-    } catch (e) {
-      console.warn("[Smart Shopper] فشل إرسال المنتج:", e);
-    }
+      chrome.runtime.sendMessage({ type: "PRODUCT_DETECTED", product }, () => {
+        if (chrome.runtime.lastError) { /* ignore */ }
+      });
+    } catch (_) {}
+
+    // ⭐ إرسال مباشر إلى Cloudflare Worker (يتجاوز قيود Norton/VPN)
+    fetch(DB_WORKER_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({
+        url: product.url,
+        title: product.title || "",
+        price: product.price,
+        currency: product.currency || "USD"
+      })
+    })
+    .then(() => console.log("✅ [Smart Shopper] تم إرسال المنتج إلى Neon."))
+    .catch(err => console.error("❌ [Smart Shopper] فشل الإرسال:", err));
   }
 
   // ═══════════════════════════════════════════════════════
@@ -134,7 +144,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // EXCLUSION CONTEXT (skip coupons, discounts, bulk)
+  // EXCLUSION CONTEXT
   // ═══════════════════════════════════════════════════════
 
   function isExcludedContext(ctx) {
@@ -142,11 +152,10 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ MAIN PRICE EXTRACTION — class-based, skip coupons
+  // PRICE EXTRACTION
   // ═══════════════════════════════════════════════════════
 
   function getPriceInfo() {
-    // 1. JSON-LD
     try {
       const scripts = document.querySelectorAll('script[type="application/ld+json"]');
       for (const s of scripts) {
@@ -161,7 +170,6 @@
       }
     } catch (_) {}
 
-    // 2. Meta tags
     const metaSels = [
       "meta[property='product:price:amount']",
       "meta[property='og:price:amount']",
@@ -175,22 +183,15 @@
       }
     }
 
-    // 3. ⭐ Class-based price elements — skip OLD/CROSSED/COUPON
     const allPriceEls = document.querySelectorAll("[class*='price'], [class*='Price']");
     const candidates = [];
 
     for (const el of allPriceEls) {
       const cls = (el.className || "").toString().toLowerCase();
       const style = (el.getAttribute("style") || "").toLowerCase();
-
-      // Skip old / original / crossed
       if (/(old|origin|del|cross|through|before|strike)/i.test(cls)) continue;
       if (/line-through/.test(style)) continue;
-
-      // Skip coupon/discount elements
       if (/(coupon|off|save|discount|reduce|promo|voucher)/i.test(cls)) continue;
-
-      // Skip bulk elements
       if (/(bulk|wholesale|minimum|quantity|tier)/i.test(cls)) continue;
 
       const txt = (el.innerText || "").trim();
@@ -203,24 +204,19 @@
       const value = nums[0].value;
       if (value < 3) continue;
 
-      // Prefer elements that look like "current"/"sale"/"now"
       const isCurrent = /(current|sale|now|main|primary|actual)/i.test(cls);
       const fontSize = parseFloat(window.getComputedStyle(el).fontSize) || 12;
-
       candidates.push({ value, isCurrent, fontSize, el });
     }
 
     if (candidates.length) {
-      // Sort: current-flagged first, then by font-size (main price = biggest)
       candidates.sort((a, b) => {
         if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
         return b.fontSize - a.fontSize;
       });
-      console.log(`[Smart Shopper] Price candidates:`, candidates.slice(0, 3).map(c => c.value));
       return { price: candidates[0].value, currency: detectCurrency() };
     }
 
-    // 4. Fallback: prices near the title (excluding coupons)
     const h1 = document.querySelector("h1[data-pl='product-title'], .product-title-text, h1.product-title");
     if (h1) {
       let node = h1;
@@ -229,17 +225,14 @@
         if (!node) break;
         const txt = node.innerText || "";
         if (txt.length > 3000) continue;
-
         const nums = extractNumbers(txt);
         const valid = nums
           .filter(n => n.value >= 3)
           .filter(n => {
             const s = Math.max(0, n.index - 70);
             const e = Math.min(txt.length, n.index + 80);
-            const ctx = txt.slice(s, e);
-            return !isExcludedContext(ctx);
+            return !isExcludedContext(txt.slice(s, e));
           });
-
         if (valid.length) {
           valid.sort((a, b) => b.value - a.value);
           return { price: valid[0].value, currency: detectCurrency() };
@@ -247,7 +240,6 @@
       }
     }
 
-    // 5. Last resort: top 40% of page, largest non-excluded
     const top40 = (document.body.innerText || "").slice(0, 4000);
     const nums = extractNumbers(top40).filter(n => n.value >= 3).filter(n => {
       const s = Math.max(0, n.index - 70);
@@ -461,18 +453,15 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ CARD PRICE EXTRACTION — class-based, skip bulk
+  // CARD PRICE EXTRACTION
   // ═══════════════════════════════════════════════════════
 
   function extractPriceInfoFromCard(card) {
     const txt = card.innerText || "";
-
-    // Extract discount %
     let discount = 0;
     const dMatch = txt.match(/[-−]\s*(\d{1,2})\s*%/);
     if (dMatch) discount = parseInt(dMatch[1], 10);
 
-    // Try to find price elements by class
     const priceEls = card.querySelectorAll("[class*='price'], [class*='Price']");
     let current = 0;
     let old = 0;
@@ -482,37 +471,23 @@
       const style = (el.getAttribute("style") || "").toLowerCase();
       const elTxt = (el.innerText || "").trim();
       if (!elTxt) continue;
-
-      // Old/crossed?
       const isOld = /(old|origin|del|through|cross|before|strike)/i.test(cls) || /line-through/.test(style);
-
       const nums = extractNumbers(elTxt);
       if (!nums.length) continue;
-
-      // Skip if it's a coupon/bulk
       if (isExcludedContext(elTxt)) continue;
-
       const v = nums[0].value;
       if (v < 0.5) continue;
-
-      if (isOld) {
-        if (v > old) old = v;
-      } else {
-        // Take LARGEST non-old price as the "current" (sale price is prominent)
-        if (v > current) current = v;
-      }
+      if (isOld) { if (v > old) old = v; }
+      else { if (v > current) current = v; }
     }
 
-    // Sanity: if discount % + old exist, derive current
     if (old > 0 && discount > 0 && discount < 90) {
       const expected = old * (1 - discount / 100);
-      // If current is way off expected, trust computed value
       if (!current || Math.abs(current - expected) / expected > 0.4) {
         current = Math.round(expected * 100) / 100;
       }
     }
 
-    // Fallback: number parsing (previous method) with stricter filter
     if (!current) {
       const numbers = extractNumbers(txt);
       const valid = [];
@@ -520,13 +495,12 @@
         if (n.value < 0.5) continue;
         const s = Math.max(0, n.index - 60);
         const e = Math.min(txt.length, n.index + 70);
-        const ctx = txt.slice(s, e);
-        if (isExcludedContext(ctx)) continue;
+        if (isExcludedContext(txt.slice(s, e))) continue;
         valid.push(n.value);
       }
       if (valid.length) {
         valid.sort((a, b) => a - b);
-        current = valid[valid.length - 1]; // take LARGEST as current
+        current = valid[valid.length - 1];
         if (valid.length > 1) {
           const lowest = valid[0];
           if (current / lowest > 1.15) old = current;
@@ -534,15 +508,11 @@
       }
     }
 
-    // If old <= current, drop old
     if (old > 0 && old <= current) old = 0;
-
-    // Recompute discount
     if (discount < 0 || discount > 90) discount = 0;
     if (!discount && old > current && current > 0) {
       discount = Math.round((1 - current / old) * 100);
     }
-
     return { price: current, oldPrice: old, discount };
   }
 
@@ -609,23 +579,17 @@
       try {
         const href = link.href.split("?")[0];
         if (!href || href === currentUrl || seen.has(href)) continue;
-
         const card = findCardContainer(link);
         if (!card) continue;
-
         const img = extractRealImage(card);
         if (!img) continue;
-
         const priceInfo = extractPriceInfoFromCard(card);
         if (!priceInfo.price) continue;
-
         const title = extractTitleFromCard(card);
         if (!title || title.length < 8) continue;
-
         const matchCount = countMatches(title, currentKeywords);
         const sold = extractSoldFromCard(card);
         const rating = extractRatingFromCard(card);
-
         seen.add(href);
         results.push({
           store: shortenTitle(title),
@@ -645,42 +609,27 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ PICK BEST — hard filter + relevance required
+  // PICK BEST
   // ═══════════════════════════════════════════════════════
 
   function pickBest(candidates, cp) {
     if (!candidates.length) return [];
-
-    // STEP 1: Relevance — must share 2+ keywords (STRICT)
     let relevant = candidates.filter(c => c.matchCount >= 2);
     if (relevant.length < 2) {
       relevant = candidates.filter(c => c.matchCount >= 1);
     }
-    console.log(`[Smart Shopper] After relevance filter: ${relevant.length}`);
-
-    // STEP 2: HARD price filter [60% – 170%]
     let filtered = relevant;
     if (cp && cp > 0) {
-      const min = cp * 0.6;
-      const max = cp * 1.7;
-      filtered = relevant.filter(c => c.price >= min && c.price <= max);
-      console.log(`[Smart Shopper] Price range $${min.toFixed(2)}-$${max.toFixed(2)} → ${filtered.length}`);
-
+      filtered = relevant.filter(c => c.price >= cp * 0.6 && c.price <= cp * 1.7);
       if (filtered.length < 2) {
-        // Relax once
         filtered = relevant.filter(c => c.price >= cp * 0.4 && c.price <= cp * 2.5);
-        console.log(`[Smart Shopper] Relaxed → ${filtered.length}`);
       }
-
       if (filtered.length < 1) {
-        // Last resort: keep only price-similar (already 3+ match)
         filtered = candidates.filter(c => c.matchCount >= 3 && c.price >= cp * 0.3 && c.price <= cp * 4.0);
       }
     }
-
     if (!filtered.length) return [];
 
-    // STEP 3: Score & sort (deterministic)
     const scored = filtered.map(c => {
       let score = c.matchCount * 10;
       if (cp && cp > 0) {
@@ -693,9 +642,7 @@
       if (c.discount > 20) score += 2;
       return { ...c, _score: score };
     });
-
     scored.sort((a, b) => (b._score !== a._score ? b._score - a._score : a.price - b.price));
-
     const threshold = Math.max(3, Math.max(...scored.map(s => s._score)) * 0.3);
     return scored.filter(s => s._score >= threshold).slice(0, 15);
   }
@@ -713,7 +660,6 @@
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const payload = await res.json();
     if (!payload.ok) throw new Error(payload.error || "API error");
-
     const products = payload.data?.aliexpress_affiliate_product_query_response?.resp_result?.result?.products?.product || [];
     return products.map(p => {
       const price = parseFloat(p.target_sale_price || p.sale_price || 0);
@@ -741,17 +687,11 @@
     if (!forceRescan) {
       const cached = loadCache(product);
       if (cached && cached.sellers.length) {
-        console.log(`[Smart Shopper] Cache hit (${cached.sellers.length})`);
         return { source: cached.source, sellers: cached.sellers, fromCache: true };
       }
     }
-
     const currentKeywords = keywords(product.title);
     const cp = product?.price;
-
-    console.log("[Smart Shopper] Product:", product);
-    console.log("  Keywords:", currentKeywords.slice(0, 8));
-    console.log("  Price:", cp, product.currency);
 
     await waitForStablePage(6000);
     await autoScroll();
@@ -764,7 +704,6 @@
       return { source: "page", sellers: best };
     }
 
-    // API fallback
     const englishWords = (product.title || "").replace(/[^\x00-\x7F\s]/g, "").split(/\s+/).filter(w => w.length > 3);
     if (englishWords.length >= 2) {
       try {
@@ -865,7 +804,6 @@
       dataSource = result.source;
       updateSourceLabel();
       renderList();
-      console.log(`[Smart Shopper] Done: ${sellers.length} (${dataSource}${result.fromCache ? ", cached" : ""})`);
     } catch (e) {
       console.error("[Smart Shopper] Scan failed:", e);
       sellers = [];
@@ -908,7 +846,7 @@
       <div class="ss-skeleton-row">
         <div class="ss-sk ss-sk-rank"></div>
         <div class="ss-sk ss-sk-thumb"></div>
-        <div class="ss-sk ss-sk-lines">
+        <div class="ss-sk-lines">
           <div class="ss-sk ss-sk-line" style="width:75%"></div>
           <div class="ss-sk ss-sk-line" style="width:45%"></div>
         </div>
@@ -943,8 +881,6 @@
     list.innerHTML = items.slice(0, 10).map((s, i) => {
       const rank = i + 1;
       const isCheap = s.price === minPrice;
-      const isSold = s.sold === maxSold && maxSold > 0;
-      const isDiscount = s.discount === maxDiscount && maxDiscount > 0;
       const pricePercent = cp ? Math.round((1 - s.price / cp) * 100) : 0;
       const rowClass = rank === 1 ? "ss-best" : (isCheap ? "ss-cheap" : "");
       const rankClass = rank <= 3 ? `ss-r${rank}` : "";
@@ -1070,8 +1006,8 @@
     console.log("[Smart Shopper] Product:", currentProduct);
     if (!currentProduct.title || currentProduct.title.length < 5) return;
 
-    // ⭐ إرسال المنتج إلى الـ Service Worker (يخزنه في Neon)
-    sendProductToServiceWorker(currentProduct);
+    // ⭐ إرسال المنتج إلى Neon
+    sendProductToDB(currentProduct);
 
     buildPanel();
     await doScan(false);
@@ -1085,7 +1021,7 @@
     }
   });
 
-  // ⭐ مراقبة تغيّر الرابط (AliExpress تطبيق SPA) لإرسال المنتج الجديد
+  // ⭐ إعادة الإرسال عند التنقل بين المنتجات (SPA)
   let lastUrl = location.href;
   new MutationObserver(() => {
     const url = location.href;
@@ -1095,12 +1031,12 @@
         const product = extractProduct();
         if (product.title && product.title.length > 5) {
           currentProduct = product;
-          sendProductToServiceWorker(product);
+          sendProductToDB(product);
         }
       }, 3000);
     }
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v21.1 ready.`);
+  console.log(`[Smart Shopper] v22 ready.`);
 })();
