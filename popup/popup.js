@@ -1,221 +1,142 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Popup Controller (Real Data)
+   Smart Shopper — Popup Script
+   يعرض المنتجات المخزنة في Neon DB.
    ═══════════════════════════════════════════════════════ */
 
-let currentProduct = null;
-let sellers = [];       // will come from API later
-let activeFilter = "best";
+const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
 
-const els = {
-  productBox:   document.getElementById("productBox"),
-  productImg:   document.getElementById("productImg"),
-  productTitle: document.getElementById("productTitle"),
-  productSub:   document.getElementById("productSub"),
-  notOnPage:    document.getElementById("notOnPage"),
-  findBtn:      document.getElementById("findBtn"),
-  filters:      document.getElementById("filters"),
-  list:         document.getElementById("list"),
-  empty:        document.getElementById("empty"),
-  sellerCount:  document.getElementById("sellerCount"),
-};
+let allProducts = [];
 
-document.addEventListener("DOMContentLoaded", init);
+document.addEventListener("DOMContentLoaded", () => {
+  loadProducts();
 
-async function init() {
-  await loadCurrentProduct();
-  els.findBtn.addEventListener("click", handleFind);
-  els.filters.addEventListener("click", handleFilterClick);
-}
+  document.getElementById("refresh").addEventListener("click", loadProducts);
 
-/* ── Load product from content script ── */
-async function loadCurrentProduct() {
-  try {
-    const res = await chrome.runtime.sendMessage({ type: "GET_CURRENT_PRODUCT" });
+  document.getElementById("searchInput").addEventListener("input", (e) => {
+    const query = e.target.value.trim().toLowerCase();
+    renderProducts(filterProducts(query));
+  });
 
-    if (!res?.ok || !res.product?.title) {
-      showNotOnPage();
-      return;
+  document.getElementById("clearBtn").addEventListener("click", async () => {
+    if (!confirm("هل أنت متأكد من مسح كل المنتجات المخزنة؟")) return;
+    try {
+      await fetch(`${WORKER_URL}/products/clear`, { method: "POST" });
+      loadProducts();
+    } catch (err) {
+      alert("فشل المسح: " + err.message);
     }
+  });
+});
 
-    currentProduct = res.product;
-    renderProduct(currentProduct);
-    els.findBtn.classList.remove("hidden");
-  } catch (e) {
-    showNotOnPage();
+async function loadProducts() {
+  const status = document.getElementById("status");
+  const list = document.getElementById("productsList");
+
+  status.textContent = "جاري التحميل...";
+  list.innerHTML = '<div class="loading">جاري التحميل...</div>';
+
+  try {
+    const res = await fetch(`${WORKER_URL}/products`);
+    const data = await res.json();
+
+    allProducts = data.rows || [];
+    status.textContent = `تم العثور على ${allProducts.length} منتج`;
+    renderProducts(allProducts);
+  } catch (err) {
+    status.textContent = "خطأ في التحميل";
+    list.innerHTML = `<div class="empty">تعذر الاتصال بالخادم<br>${err.message}</div>`;
   }
 }
 
-function renderProduct(p) {
-  els.productBox.classList.remove("hidden");
-  els.notOnPage.classList.add("hidden");
+function filterProducts(query) {
+  if (!query) return allProducts;
+  return allProducts.filter(p => {
+    const title = (p.title || "").toLowerCase();
+    const url = (p.product_url || "").toLowerCase();
+    return title.includes(query) || url.includes(query);
+  });
+}
 
-  els.productTitle.textContent = p.title || "Untitled product";
+function renderProducts(products) {
+  const list = document.getElementById("productsList");
+  const stats = document.getElementById("stats");
 
-  if (p.image) {
-    els.productImg.src = p.image;
-    els.productImg.onerror = () => { els.productImg.style.display = "none"; };
-  } else {
-    els.productImg.style.display = "none";
+  if (!products.length) {
+    list.innerHTML = '<div class="empty">لا توجد منتجات محفوظة بعد<br>تصفح AliExpress لبدء التسجيل</div>';
+    stats.textContent = "";
+    return;
   }
 
-  const parts = [];
-  if (p.price != null) parts.push(`<span class="price-current">$${p.price.toFixed(2)}</span>`);
-  if (p.rating != null) parts.push(`★ ${p.rating}`);
-  if (p.sold != null) parts.push(`${fmt(p.sold)} sold`);
+  // الإحصائيات
+  const avgPrice = (products.reduce((sum, p) => sum + parseFloat(p.price || 0), 0) / products.length).toFixed(2);
+  stats.innerHTML = `📊 متوسط السعر: <b>$${avgPrice}</b> · عدد: <b>${products.length}</b>`;
 
-  els.productSub.innerHTML = parts.join(`<span class="dot">●</span>`)
-    || `<span style="color:var(--fg-3)">No details extracted</span>`;
-}
+  list.innerHTML = products.map(p => {
+    const title = escapeHtml(p.title || "بدون عنوان");
+    const price = formatPrice(p.price, p.currency);
+    const rating = p.rating ? `<span class="product-rating">★ ${parseFloat(p.rating).toFixed(1)}</span>` : "";
+    const sold = p.sold_count ? `<span class="product-sold">${formatNumber(p.sold_count)} مباع</span>` : "";
+    const img = p.image_url ? `<img src="${escapeHtml(p.image_url)}" loading="lazy" onerror="this.style.display='none'">` : "";
+    const time = formatTime(p.updated_at || p.scraped_at);
 
-function showNotOnPage() {
-  els.productBox.classList.add("hidden");
-  els.notOnPage.classList.remove("hidden");
-  els.findBtn.classList.add("hidden");
-  els.filters.classList.add("hidden");
-  els.sellerCount.textContent = "— sellers";
-}
+    return `
+      <div class="product" data-url="${escapeHtml(p.product_url)}">
+        <div class="product-thumb">${img}</div>
+        <div class="product-info">
+          <div class="product-title">${title}</div>
+          <div class="product-meta">
+            <span class="product-price">${price}</span>
+            ${rating}
+            ${sold}
+          </div>
+          <div class="product-time">${time}</div>
+        </div>
+      </div>
+    `;
+  }).join("");
 
-/* ── Find button ── */
-async function handleFind() {
-  els.findBtn.disabled = true;
-  els.findBtn.textContent = "Scanning…";
-  els.list.innerHTML = Array.from({ length: 5 }).map(skeleton).join("");
-  els.empty.classList.add("hidden");
-
-  // TODO: call real API. For now → mock.
-  await sleep(1200);
-  sellers = MOCK_SELLERS;
-  renderList();
-
-  els.findBtn.disabled = false;
-  els.findBtn.textContent = "🔍 Search again";
-  els.filters.classList.remove("hidden");
-}
-
-/* ── Render list ── */
-function renderList() {
-  const items = sortSellers(sellers, activeFilter);
-  els.list.innerHTML = "";
-  els.empty.classList.toggle("hidden", items.length > 0);
-  els.sellerCount.textContent = `${items.length} sellers`;
-
-  const minPrice = Math.min(...items.map(s => s.price));
-  const maxRating = Math.max(...items.map(s => s.rating));
-  const maxSold = Math.max(...items.map(s => s.sold));
-
-  items.forEach((s, i) => {
-    els.list.appendChild(buildRow(s, i, {
-      isCheap: s.price === minPrice,
-      isTop:   s.rating === maxRating,
-      isSold:  s.sold === maxSold,
-      rank:    i + 1,
-    }));
+  // فتح الرابط عند النقر
+  list.querySelectorAll(".product").forEach(el => {
+    el.addEventListener("click", () => {
+      const url = el.dataset.url;
+      if (url) chrome.tabs.create({ url });
+    });
   });
 }
 
-function buildRow(s, i, opts) {
-  const el = document.createElement("div");
-  el.className = "row";
-  el.style.animationDelay = `${i * 25}ms`;
-
-  const rank = opts.rank;
-  if (rank === 1) el.classList.add("best");
-  else if (opts.isCheap) el.classList.add("cheap");
-
-  const pricePercent = currentProduct?.price
-    ? Math.round((1 - s.price / currentProduct.price) * 100)
-    : 0;
-  const ratingDelta = currentProduct?.rating ? s.rating - currentProduct.rating : 0;
-  const soldDelta   = currentProduct?.sold ? s.sold - currentProduct.sold : 0;
-
-  const rankClass = rank <= 3 ? `r${rank}` : "";
-
-  let tag = "";
-  if (activeFilter === "cheap" && rank === 1) tag = `<span class="save-tag cheap">Cheapest</span>`;
-  else if (activeFilter === "rated" && rank === 1) tag = `<span class="save-tag top">Top Rated</span>`;
-  else if (activeFilter === "sold" && rank === 1) tag = `<span class="save-tag top">Most Sold</span>`;
-  else if (activeFilter === "best" && rank === 1) tag = `<span class="save-tag best">Best Value</span>`;
-  else if (opts.isCheap) tag = `<span class="save-tag cheap">Best Price</span>`;
-
-  el.innerHTML = `
-    ${tag}
-    <div class="rank ${rankClass}">${rank}</div>
-    <div class="thumb"><img src="${s.img}" loading="lazy" onerror="this.style.display='none'"></div>
-    <div class="info">
-      <div class="store">${esc(s.store)}</div>
-      <div class="meta">
-        <span class="rating">★ ${s.rating}</span>
-        <span class="${ratingDelta >= 0 ? "up" : "down"}">${ratingDelta > 0 ? "▲" : ratingDelta < 0 ? "▼" : ""}</span>
-        <span class="dot">●</span>
-        <span>${fmt(s.sold)}</span>
-        <span class="${soldDelta >= 0 ? "up" : "down"}">${soldDelta > 0 ? "▲" : soldDelta < 0 ? "▼" : ""}</span>
-      </div>
-    </div>
-    <div class="price-col">
-      <div class="price-now">$${s.price.toFixed(2)}</div>
-      <div class="price-was">$${currentProduct?.price?.toFixed(2) || ""} · −${pricePercent}%</div>
-    </div>
-  `;
-
-  el.addEventListener("click", () => {
-    if (s.link) window.open(s.link, "_blank", "noopener");
-    else alert(`Seller: ${s.store}\nPrice: $${s.price}\nRating: ★ ${s.rating}\nSold: ${s.sold}`);
-  });
-
-  return el;
+/* ─── Helpers ─── */
+function formatPrice(value, currency) {
+  if (value == null) return "—";
+  const symbols = { USD: "$", EUR: "€", GBP: "£", SAR: "﷼", DA: "DA ", TRY: "₺", RUB: "₽", CNY: "¥" };
+  const sym = symbols[currency] || "$";
+  const num = parseFloat(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return `${sym}${num}`;
 }
 
-/* ── Filters ── */
-function handleFilterClick(e) {
-  const chip = e.target.closest(".chip");
-  if (!chip) return;
-  activeFilter = chip.dataset.f;
-  els.filters.querySelectorAll(".chip").forEach((c) =>
-    c.classList.toggle("active", c === chip)
-  );
-  renderList();
+function formatNumber(n) {
+  n = parseInt(n, 10);
+  if (n >= 1000) return (n / 1000).toFixed(1).replace(".0", "") + "k";
+  return n;
 }
 
-/* ── Sort ── */
-function sortSellers(arr, f) {
-  const copy = [...arr];
-  if (f === "cheap") return copy.sort((a, b) => a.price - b.price);
-  if (f === "rated") return copy.sort((a, b) => b.rating - a.rating);
-  if (f === "sold")  return copy.sort((a, b) => b.sold - a.sold);
-  return copy.sort((a, b) => valueScore(b) - valueScore(a));
+function formatTime(isoStr) {
+  if (!isoStr) return "";
+  try {
+    const date = new Date(isoStr);
+    const diff = Date.now() - date.getTime();
+    const mins = Math.floor(diff / 60000);
+    const hours = Math.floor(diff / 3600000);
+    const days = Math.floor(diff / 86400000);
+    if (mins < 1) return "الآن";
+    if (mins < 60) return `قبل ${mins} دقيقة`;
+    if (hours < 24) return `قبل ${hours} ساعة`;
+    if (days < 30) return `قبل ${days} يوم`;
+    return date.toLocaleDateString("ar-EG");
+  } catch (_) { return ""; }
 }
 
-function valueScore(s) {
-  const cp = currentProduct?.price || 25;
-  const priceScore  = (cp - s.price) / cp;
-  const ratingScore = s.rating / 5;
-  const soldScore   = Math.min(s.sold / 5000, 1);
-  return priceScore * 0.5 + ratingScore * 0.3 + soldScore * 0.2;
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
 }
-
-/* ── MOCK (temporary until real API) ── */
-const MOCK_SELLERS = [
-  { store:"SoundMax Official", img:"https://picsum.photos/seed/s1/80/80", price:18.50, rating:4.8, sold:3500, link:"" },
-  { store:"AudioLab Store",    img:"https://picsum.photos/seed/s2/80/80", price:16.90, rating:4.6, sold:1800, link:"" },
-  { store:"FitSound Global",   img:"https://picsum.photos/seed/s3/80/80", price:22.00, rating:4.9, sold:950,  link:"" },
-  { store:"BassWave Audio",    img:"https://picsum.photos/seed/s4/80/80", price:20.50, rating:4.7, sold:2400, link:"" },
-  { store:"TechNova Store",    img:"https://picsum.photos/seed/s5/80/80", price:17.80, rating:4.4, sold:1200, link:"" },
-];
-
-/* ── Helpers ── */
-function skeleton() {
-  return `
-    <div class="sk-row">
-      <div class="sk sk-rank"></div>
-      <div class="sk sk-thumb"></div>
-      <div class="sk-lines">
-        <div class="sk sk-line" style="width:75%"></div>
-        <div class="sk sk-line" style="width:45%"></div>
-      </div>
-      <div class="sk sk-line" style="width:45px;height:14px"></div>
-    </div>`;
-}
-
-const esc = (s) => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
-const fmt = (n) => n >= 1000 ? (n / 1000).toFixed(1).replace(".0", "") + "k" : n;
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
