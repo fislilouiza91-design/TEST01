@@ -1,67 +1,37 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ar" dir="rtl">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Smart Shopper</title>
-<link rel="stylesheet" href="popup.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Shopper</title>
+  <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-
-<div class="app">
-
-  <header class="header">
-    <h1>Smart Shopper <span>· AliExpress</span></h1>
-    <span class="seller-count" id="sellerCount">— sellers</span>
-  </header>
-
-  <!-- PRODUCT DETECTED -->
-  <div class="product" id="productBox">
-    <div class="product-thumb">
-      <img id="productImg" src="" alt="">
-    </div>
-    <div class="product-info">
-      <div class="product-title" id="productTitle">Loading…</div>
-      <div class="product-sub" id="productSub">
-        <span>Reading product…</span>
+  <div class="header">
+    <div class="logo-row">
+      <div class="logo">S</div>
+      <div>
+        <div class="title">Smart Shopper</div>
+        <div class="subtitle" id="status">جاري التحميل...</div>
       </div>
     </div>
+    <button id="refresh" class="btn-icon" title="تحديث">↻</button>
   </div>
 
-  <!-- NOT ON ALIEXPRESS -->
-  <div class="not-on-page hidden" id="notOnPage">
-    <p class="not-title">Open an AliExpress product page</p>
-    <p class="not-sub">Go to any product on AliExpress, then click this icon again.</p>
+  <div class="search-bar">
+    <input type="text" id="searchInput" placeholder="ابحث في المنتجات المحفوظة...">
   </div>
 
-  <!-- FIND BUTTON -->
-  <button class="btn-find hidden" id="findBtn">
-    🔍 Compare sellers
-  </button>
+  <div class="stats" id="stats"></div>
 
-  <!-- FILTERS -->
-  <div class="filters hidden" id="filters">
-    <button class="chip active" data-f="best">Best value</button>
-    <button class="chip" data-f="cheap">Cheapest</button>
-    <button class="chip" data-f="rated">Top rated</button>
-    <button class="chip" data-f="sold">Most sold</button>
-  </div>
-
-  <!-- LIST -->
-  <div class="list-wrap">
-    <div class="list" id="list"></div>
-    <div class="empty hidden" id="empty">
-      <p class="empty-title">No comparison available</p>
-      <p class="empty-sub">We couldn't find other sellers for this product.</p>
-    </div>
+  <div class="products-list" id="productsList">
+    <div class="loading">جاري التحميل...</div>
   </div>
 
   <div class="footer">
-    Prices in USD · We may earn a commission
+    <button id="clearBtn" class="btn-clear">🗑️ مسح الكل</button>
   </div>
 
-</div>
-
-<script src="popup.js"></script>
+  <script src="popup.js"></script>
 </body>
 </html>
