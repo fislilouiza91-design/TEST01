@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v33)
-   Reverted to original display logic (old price shown as-is)
-   + Cache-first, real prices from server, strict matching
+   Smart Shopper — Content Script (v34)
+   - Removed the "fetch real prices" button from panel
+   - Cache-first, strict matching, original display logic
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -14,7 +14,7 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v33 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v34 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
@@ -66,7 +66,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // FETCH REAL PRICES FROM SERVER (zero client cost)
+  // FETCH REAL PRICES FROM SERVER (used internally, not button)
   // ═══════════════════════════════════════════════════════
 
   async function fetchRealPricesBatch(sellersList) {
@@ -709,7 +709,6 @@
         if (valid.length > 1 && current / valid[0] > 1.15) old = current;
       }
     }
-    // الحالة الأصلية
     if (old > 0 && old <= current) old = 0;
     if (discount < 0 || discount > 90) discount = 0;
     if (!discount && old > current && current > 0) discount = Math.round((1 - current / old) * 100);
@@ -961,7 +960,6 @@
             </div>
           </div>
           <div class="ss-header-actions">
-            <button class="ss-btn-icon" data-action="fetch-real-prices" title="تحديث الأسعار الحقيقية">💱</button>
             <button class="ss-btn-icon" data-action="refresh" title="Refresh">↻</button>
             <button class="ss-btn-icon" data-action="minimize">−</button>
             <button class="ss-btn-icon" data-action="close">×</button>
@@ -996,10 +994,6 @@
         clearCache(currentProduct);
         lastSentSimilar = "";
         await doScan(true);
-      });
-      panel.querySelector("[data-action='fetch-real-prices']").addEventListener("click", async () => {
-        if (isScanning || !sellers.length) return;
-        await fetchRealPricesBatch(sellers);
       });
       panel.querySelector("#ss-filters").addEventListener("click", (e) => {
         const chip = e.target.closest(".ss-chip");
@@ -1130,10 +1124,7 @@
       else if (isCheap && cp) tag = `<span class="ss-tag ss-cheap">${T("bestPrice")}</span>`;
 
       const discountBadge = s.discount > 0 ? `<span class="ss-discount">-${s.discount}%</span>` : "";
-
-      // الحالة الأصلية — يُعرض السعر القديم دائماً إذا وُجد
       const oldPriceHtml = s.oldPrice > 0 ? `<span class="ss-old-price">${formatPrice(s.oldPrice, currentProduct?.currency)}</span>` : "";
-
       const ratingHtml = s.rating > 0 ? `<span class="ss-rating">★ ${s.rating.toFixed(1)}</span>` : "";
       const soldHtml = s.sold > 0 ? `<span class="ss-sold">${fmt(s.sold)} ${T("sold")}</span>` : "";
       const metaItems = [ratingHtml, soldHtml].filter(Boolean).join('<span class="ss-sep">·</span>');
@@ -1297,5 +1288,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v33 ready.`);
+  console.log(`[Smart Shopper] v34 ready.`);
 })();
