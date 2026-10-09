@@ -1,5 +1,6 @@
 /* ═══════════════════════════════════════════
-   Smart Shopper — Floating Panel (v16 RTL)
+   Smart Shopper — Floating Panel (v17 RTL)
+   + Shipping indicators (Free / Paid)
    ═══════════════════════════════════════════ */
 
 #ss-floating-panel,
@@ -244,6 +245,7 @@
   color: #52525b;
   white-space: nowrap;
   overflow: hidden;
+  flex-wrap: wrap;
 }
 
 .ss-rating { color: #b45309; font-weight: 700; }
@@ -368,3 +370,24 @@
 }
 
 #ss-floating-panel.ss-dragging .ss-header { cursor: grabbing; }
+
+/* ⭐ Shipping indicators */
+.ss-free-ship {
+  font-size: 9.5px;
+  font-weight: 700;
+  color: #16a34a;
+  background: #dcfce7;
+  padding: 1px 5px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.ss-paid-ship {
+  font-size: 9.5px;
+  font-weight: 600;
+  color: #71717a;
+  background: #f4f4f5;
+  padding: 1px 5px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
