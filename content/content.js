@@ -1,7 +1,6 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v34)
-   - Removed the "fetch real prices" button from panel
-   - Cache-first, strict matching, original display logic
+   Smart Shopper — Content Script (v35)
+   + Shipping indicator (Free / Paid)
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -14,7 +13,7 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v34 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v35 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
@@ -66,7 +65,59 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // FETCH REAL PRICES FROM SERVER (used internally, not button)
+  // ⭐ SHIPPING DETECTION
+  // ═══════════════════════════════════════════════════════
+
+  function extractShippingFromCard(card) {
+    try {
+      const txt = (card.innerText || "").toLowerCase();
+
+      // ─── 1. كشف الشحن المجاني ───
+      const freePatterns = [
+        /free\s+shipping/i,
+        /free\s+delivery/i,
+        /livraison\s+gratuite/i,
+        /env[íi]o\s+gratis/i,
+        /kostenloser\s+versand/i,
+        /الشحن\s+مجاني/,
+        /شحن\s+مجاني/,
+        /免費送貨/,
+        /送料無料/,
+        /무료\s*배송/,
+      ];
+      for (const re of freePatterns) {
+        if (re.test(txt)) return { isFreeShipping: true, shippingText: "Free" };
+      }
+
+      // ─── 2. كشف الشحن المدفوع ───
+      const paidPatterns = [
+        /(?:shipping|delivery|freight)\s*:?\s*\$?\s*([\d.]+)/i,
+        /\$\s*([\d.]+)\s*(?:shipping|delivery)/i,
+        /livraison\s*:?\s*([\d.,]+)/i,
+      ];
+      for (const re of paidPatterns) {
+        const m = txt.match(re);
+        if (m) {
+          const amt = parseFloat(m[1].replace(",", "."));
+          if (amt > 0 && amt < 500) {
+            return { isFreeShipping: false, shippingText: "Paid" };
+          }
+        }
+      }
+
+      // ─── 3. إذا ذكر "shipping" بدون "free" → مدفوع ───
+      if (/(shipping|delivery|livraison|envío)/i.test(txt)) {
+        return { isFreeShipping: false, shippingText: "Paid" };
+      }
+
+      return { isFreeShipping: null, shippingText: "" };
+    } catch (_) {
+      return { isFreeShipping: null, shippingText: "" };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // FETCH REAL PRICES FROM SERVER (internal use)
   // ═══════════════════════════════════════════════════════
 
   async function fetchRealPricesBatch(sellersList) {
@@ -807,6 +858,7 @@
 
         const sold = extractSoldFromCard(card);
         const rating = extractRatingFromCard(card);
+        const shippingInfo = extractShippingFromCard(card);
         seen.add(href);
         const modelMatches = currentModels.length > 0 ? currentModels.filter(m => upperTitle.includes(m)).length : 0;
         const brandMatches = currentBrands.length > 0 ? currentBrands.filter(b => upperTitle.includes(b.toUpperCase())).length : 0;
@@ -815,7 +867,9 @@
           store: shortenTitle(title),
           img, price: priceInfo.price, oldPrice: priceInfo.oldPrice, discount: priceInfo.discount,
           rating, sold: sold || 0, link: href, matchCount, modelMatches, brandMatches,
-          specMatches: specResult.matched, specTotal: specResult.total, specRatio: specResult.ratio, priceRatio
+          specMatches: specResult.matched, specTotal: specResult.total, specRatio: specResult.ratio, priceRatio,
+          isFreeShipping: shippingInfo.isFreeShipping,
+          shippingText: shippingInfo.shippingText
         });
       } catch (_) {}
     }
@@ -839,6 +893,7 @@
       if (c.rating >= 4.5) score += 5;
       if (c.sold > 100) score += 3;
       if (c.discount > 20) score += 2;
+      if (c.isFreeShipping === true) score += 4;   // ⭐ مكافأة للشحن المجاني
       return { ...c, _score: score };
     });
     scored.sort((a, b) => (b._score !== a._score ? b._score - a._score : a.price - b.price));
@@ -864,6 +919,12 @@
       const oldP = parseFloat(p.target_original_price || p.original_price || 0);
       const discount = oldP > price && price > 0 ? Math.round((1 - price / oldP) * 100) : 0;
       const rating = parseFloat(String(p.evaluate_rate || "0").replace("%", "")) / 20;
+      let isFree = null;
+      if (p.freight_amount !== undefined && p.freight_amount !== null) {
+        const amt = parseFloat(p.freight_amount);
+        if (!isNaN(amt)) isFree = amt === 0;
+      }
+      if (p.free_shipping === "true" || p.free_shipping === true) isFree = true;
       return {
         store: p.shop_name || "AliExpress Seller",
         img: p.product_main_image_url || "",
@@ -872,7 +933,9 @@
         sold: parseInt(p.lastest_volume || 0, 10),
         link: p.product_detail_url || p.promotion_link || "",
         title: p.product_title || "",
-        matchCount: 0, modelMatches: 0, brandMatches: 0, specRatio: 0, priceRatio: 1
+        matchCount: 0, modelMatches: 0, brandMatches: 0, specRatio: 0, priceRatio: 1,
+        isFreeShipping: isFree,
+        shippingText: ""
       };
     }).filter(s => s.price > 0 && s.img);
   }
@@ -1127,7 +1190,16 @@
       const oldPriceHtml = s.oldPrice > 0 ? `<span class="ss-old-price">${formatPrice(s.oldPrice, currentProduct?.currency)}</span>` : "";
       const ratingHtml = s.rating > 0 ? `<span class="ss-rating">★ ${s.rating.toFixed(1)}</span>` : "";
       const soldHtml = s.sold > 0 ? `<span class="ss-sold">${fmt(s.sold)} ${T("sold")}</span>` : "";
-      const metaItems = [ratingHtml, soldHtml].filter(Boolean).join('<span class="ss-sep">·</span>');
+
+      // ⭐ مؤشر الشحن
+      let shippingHtml = "";
+      if (s.isFreeShipping === true) {
+        shippingHtml = `<span class="ss-free-ship" title="Free shipping">🚚 Free</span>`;
+      } else if (s.isFreeShipping === false) {
+        shippingHtml = `<span class="ss-paid-ship" title="Paid shipping">💵 Paid</span>`;
+      }
+
+      const metaItems = [ratingHtml, soldHtml, shippingHtml].filter(Boolean).join('<span class="ss-sep">·</span>');
       const saveStr = pricePercent > 0 ? `−${pricePercent}%` : (pricePercent < 0 ? `+${Math.abs(pricePercent)}%` : "");
       const realBadge = s._realPrice ? `<span class="ss-real-price" title="سعر حقيقي">✓</span>` : "";
 
@@ -1216,7 +1288,8 @@
     const discountScore = Math.min((s.discount || 0) / 60, 1);
     const matchScore = Math.min((s.matchCount || 0) / 5, 1);
     const modelScore = Math.min((s.modelMatches || 0) / 3, 1);
-    return priceScore * 0.2 + soldScore * 0.1 + discountScore * 0.15 + matchScore * 0.25 + modelScore * 0.3;
+    const shippingBonus = s.isFreeShipping === true ? 0.05 : 0;
+    return priceScore * 0.2 + soldScore * 0.1 + discountScore * 0.15 + matchScore * 0.25 + modelScore * 0.3 + shippingBonus;
   }
 
   function sortSellers(arr, f) {
@@ -1288,5 +1361,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v34 ready.`);
+  console.log(`[Smart Shopper] v35 ready.`);
 })();
