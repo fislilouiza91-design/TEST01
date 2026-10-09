@@ -1,7 +1,6 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v26)
-   Focus: Find OTHER SELLERS of the EXACT SAME product.
-   Strict matching: model + brand + specs + keywords + price.
+   Smart Shopper — Content Script (v27)
+   Strict matching + Smart API fallback (with filtering).
    Design and filters preserved unchanged.
    ═══════════════════════════════════════════════════════ */
 
@@ -15,7 +14,7 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v26 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v27 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
@@ -179,7 +178,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ PRODUCT ID / MODEL / BRAND / SPECS EXTRACTION
+  // PRODUCT ID / MODEL / BRAND / SPECS EXTRACTION
   // ═══════════════════════════════════════════════════════
 
   function extractProductId(url) {
@@ -192,8 +191,8 @@
     if (!text) return [];
     const models = new Set();
     const patterns = [
-      /\b([A-Z]{1,4}[\s-]?\d{2,5}[A-Z]?)\b/g,          // E88, XR15, WH-1000XM5
-      /\b([A-Z]\d{3,5}[A-Z]?)\b/g,                      // A1234
+      /\b([A-Z]{1,4}[\s-]?\d{2,5}[A-Z]?)\b/g,
+      /\b([A-Z]\d{3,5}[A-Z]?)\b/g,
       /\b(iPhone\s*\d{1,2}\s*(Pro|Max|Plus|Mini)?)\b/gi,
       /\b(Galaxy\s*[A-Z]\d{1,2}\s*(Ultra|Plus)?)\b/gi,
       /\b(Redmi\s*Note\s*\d{1,2}\s*(Pro)?)\b/gi,
@@ -255,16 +254,6 @@
       if (upper.includes(s.replace(/\s+/g, ""))) matched++;
     }
     return { matched, total: specs.length, ratio: matched / specs.length };
-  }
-
-  function modelMatchCount(text, models) {
-    if (!text || !models.length) return 0;
-    const upper = text.toUpperCase();
-    let count = 0;
-    for (const m of models) {
-      if (upper.includes(m)) count++;
-    }
-    return count;
   }
 
   // ═══════════════════════════════════════════════════════
@@ -606,7 +595,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ STRICT SCRAPER — only EXACT same product
+  // STRICT SCRAPER
   // ═══════════════════════════════════════════════════════
 
   function collectCandidates(currentKeywords, currentModels, currentBrands, currentSpecs, cp) {
@@ -625,7 +614,6 @@
         const href = link.href.split("?")[0];
         if (!href || href === currentUrl || seen.has(href)) continue;
 
-        // ⭐ استبعاد المنتج الأصلي بالمعرّف
         const candidateId = extractProductId(href);
         if (currentProductId && candidateId && currentProductId === candidateId) continue;
 
@@ -640,30 +628,25 @@
 
         const upperTitle = title.toUpperCase();
 
-        // ─── الشرط 1: الموديل ───
         if (currentModels.length > 0) {
           const matched = currentModels.filter(m => upperTitle.includes(m));
           if (matched.length === 0) { rejectedByModel++; continue; }
         }
 
-        // ─── الشرط 2: العلامة التجارية ───
         if (currentBrands.length > 0) {
           const matched = currentBrands.filter(b => upperTitle.includes(b.toUpperCase()));
           if (matched.length === 0) { rejectedByBrand++; continue; }
         }
 
-        // ─── الشرط 3: المواصفات التقنية (70%+) ───
         const specResult = countSpecMatches(title, currentSpecs);
         if (currentSpecs.length >= 2 && specResult.ratio < 0.7) { rejectedBySpecs++; continue; }
 
-        // ─── الشرط 4: الكلمات المشتركة ───
         const matchCount = countMatches(title, currentKeywords);
         const totalKeywords = currentKeywords.length;
         const matchRatio = totalKeywords > 0 ? matchCount / totalKeywords : 0;
         const isStrictKeywordMatch = matchCount >= 4 || (totalKeywords <= 5 && matchCount >= 3) || matchRatio >= 0.6;
         if (!isStrictKeywordMatch) { rejectedByKeywords++; continue; }
 
-        // ─── الشرط 5: نطاق السعر (60%-160%) ───
         const priceRatio = cp ? priceInfo.price / cp : 1;
         if (cp && (priceRatio < 0.6 || priceRatio > 1.6)) { rejectedByPrice++; continue; }
 
@@ -728,14 +711,14 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // API FALLBACK
+  // API SEARCH
   // ═══════════════════════════════════════════════════════
 
   async function apiSearch(keyword) {
     const res = await fetch(`${WORKER_URL}/api/search`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ keyword, pageSize: 20 }),
+      body: JSON.stringify({ keyword, pageSize: 40 }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const payload = await res.json();
@@ -797,19 +780,68 @@
       return { source: "page", sellers: best };
     }
 
-    const englishWords = (product.title || "").replace(/[^\x00-\x7F\s]/g, "").split(/\s+/).filter(w => w.length > 3);
-    if (englishWords.length >= 2) {
+    // ⭐ API Fallback مع فلترة صارمة واختيار ذكي للكلمات
+    const englishWords = (product.title || "").replace(/[^\x00-\x7F\s]/g, "").split(/\s+/)
+      .map(w => w.trim().toLowerCase())
+      .filter(w => w.length > 3 && !STOP_WORDS.has(w));
+
+    // الترتيب حسب الطول (الكلمات الطويلة عادة أكثر تحديداً)
+    englishWords.sort((a, b) => b.length - a.length);
+
+    // بناء 3 محاولات بحث بكلمات مختلفة
+    const queries = [];
+    if (englishWords.length >= 3) queries.push(englishWords.slice(0, 4).join(" "));
+    if (englishWords.length >= 2) queries.push(englishWords.slice(0, 3).join(" "));
+    if (englishWords.length >= 2) queries.push(englishWords.slice(1, 4).join(" "));
+
+    console.log(`[Smart Shopper] API Queries:`, queries);
+
+    for (const q of queries) {
       try {
-        const items = await apiSearch(englishWords.slice(0, 3).join(" "));
-        if (items.length > 0) {
-          const filtered = cp ? items.filter(it => it.price >= cp * 0.7 && it.price <= cp * 1.5) : items;
-          const finalList = filtered.length >= 1 ? filtered : items;
-          saveCache(product, finalList, "api");
-          return { source: "api", sellers: finalList };
+        const items = await apiSearch(q);
+        if (items.length === 0) continue;
+
+        // ⭐ فلترة صارمة لنتائج API
+        const strict = items.filter(it => {
+          const upperTitle = (it.title || it.store || "").toUpperCase();
+
+          // نفس الموديل (إن وُجد)
+          if (currentModels.length > 0) {
+            const hasModel = currentModels.some(m => upperTitle.includes(m));
+            if (!hasModel) return false;
+          }
+
+          // نفس العلامة (إن وُجدت)
+          if (currentBrands.length > 0) {
+            const hasBrand = currentBrands.some(b => upperTitle.includes(b.toUpperCase()));
+            if (!hasBrand) return false;
+          }
+
+          // كلمات مشتركة كافية
+          const matchCount = countMatches(it.title || it.store, currentKeywords);
+          if (matchCount < 4 && (currentKeywords.length > 5 || matchCount < 3)) return false;
+
+          // السعر ضمن نطاق مقبول
+          if (cp && (it.price < cp * 0.5 || it.price > cp * 1.8)) return false;
+
+          return true;
+        });
+
+        console.log(`[Smart Shopper] API strict filtered: ${strict.length} of ${items.length}`);
+
+        if (strict.length >= 1) {
+          // إضافة معلومات المطابقة لكل نتيجة
+          const enriched = strict.map(it => ({
+            ...it,
+            matchCount: countMatches(it.title || it.store, currentKeywords)
+          }));
+          saveCache(product, enriched, "api");
+          return { source: "api", sellers: enriched };
         }
       } catch (e) { console.warn(e); }
     }
 
+    // ⭐ لا نتائج صالحة → نُعيد قائمة فارغة (أفضل من نتائج خاطئة)
     return { source: "none", sellers: [] };
   }
 
@@ -1136,5 +1168,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v26 ready.`);
+  console.log(`[Smart Shopper] v27 ready.`);
 })();
