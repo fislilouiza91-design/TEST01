@@ -1,9 +1,10 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v28)
-   - Cache-first strategy (saves Bright Data costs)
-   - Stores only raw URLs in DB
-   - Generates fresh affiliate links on display
-   - Strict matching for EXACT same product
+   Smart Shopper — Content Script (v29)
+   + Detects page country/currency from AliExpress itself
+   + Passes country/currency to AliExpress API for accurate prices
+   + Cache-first strategy (saves Bright Data costs)
+   + Stores only raw URLs in DB
+   + Generates fresh affiliate links on display
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -16,7 +17,7 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v28 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v29 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
@@ -24,7 +25,7 @@
   const DB_SIMILAR_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/similar";
   const AFFILIATE_LINK_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/api/link";
   const CACHE_TTL = 1000 * 60 * 30;
-  const DB_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 أيام
+  const DB_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
   let currentProduct = null;
   let sellers = [];
@@ -36,7 +37,71 @@
   let lastSentSimilar = "";
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ SEND MAIN PRODUCT TO NEON
+  // ⭐ DETECT PAGE CURRENCY & COUNTRY
+  // ═══════════════════════════════════════════════════════
+
+  function extractPageCurrencyAndCountry() {
+    const result = { currency: "USD", country: "US" };
+
+    // ─── 1. البحث في عناصر الصفحة ───
+    try {
+      // AliExpress عادة يضع العملة في عناصر بـ class يحتوي على currency
+      const currencyEls = document.querySelectorAll(
+        "[class*='currency'], [class*='Currency'], [data-currency], .es--wrap--MsZha, [class*='ship-to']"
+      );
+      for (const el of currencyEls) {
+        const txt = (el.innerText || el.getAttribute("data-currency") || "").trim().toUpperCase();
+        const m = txt.match(/\b(USD|EUR|GBP|DZD|SAR|AED|TRY|RUB|CNY|JPY|KRW|BRL|MXN|CAD|AUD|INR|CHF|SEK|PLN|EGP|MAD|TND|JOD|KWD|QAR|OMR|BHD|LYD|IQD)\b/);
+        if (m) { result.currency = m[1]; break; }
+      }
+    } catch (_) {}
+
+    // ─── 2. البحث في cookies ───
+    if (result.currency === "USD") {
+      try {
+        const cm = document.cookie.match(/(?:aep_currency|currency|_currency)=([A-Z]{3})/);
+        if (cm) result.currency = cm[1];
+      } catch (_) {}
+    }
+
+    // ─── 3. البحث في localStorage ───
+    if (result.currency === "USD") {
+      try {
+        const ls = localStorage.getItem("aep_currency") || localStorage.getItem("currency");
+        if (ls && /^[A-Z]{3}$/.test(ls)) result.currency = ls;
+      } catch (_) {}
+    }
+
+    // ─── 4. استخراج البلد من علامة ship to ───
+    try {
+      const shipEls = document.querySelectorAll("[class*='shipTo'], [class*='ship-to'], [class*='country']");
+      for (const el of shipEls) {
+        const txt = (el.innerText || "").trim();
+        const m = txt.match(/\b(US|FR|GB|DE|ES|IT|DZ|SA|AE|TR|RU|CN|JP|KR|BR|MX|CA|AU|IN|EG|MA|TN|JO|KW|QA|OM|BH|LY|IQ)\b/);
+        if (m) { result.country = m[1]; break; }
+      }
+    } catch (_) {}
+
+    // ─── 5. ربط العملة بالبلد (إذا لم نجد البلد) ───
+    const currencyToCountry = {
+      USD: "US", EUR: "FR", GBP: "GB", DZD: "DZ", SAR: "SA",
+      AED: "AE", TRY: "TR", RUB: "RU", CNY: "CN", JPY: "JP",
+      KRW: "KR", BRL: "BR", MXN: "MX", CAD: "CA", AUD: "AU",
+      INR: "IN", CHF: "CH", SEK: "SE", PLN: "PL", EGP: "EG",
+      MAD: "MA", TND: "TN", JOD: "JO", KWD: "KW", QAR: "QA",
+      OMR: "OM", BHD: "BH", LYD: "LY", IQD: "IQ"
+    };
+
+    if (!result.country || result.country === "US") {
+      result.country = currencyToCountry[result.currency] || "US";
+    }
+
+    console.log(`[Smart Shopper] 💱 Currency: ${result.currency} | 🌍 Country: ${result.country}`);
+    return result;
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // SEND MAIN PRODUCT TO NEON
   // ═══════════════════════════════════════════════════════
 
   function sendProductToDB(product) {
@@ -66,30 +131,25 @@
         sold: product.sold || null,
         discount: null
       })
-    })
-    .then(() => console.log("✅ [Smart Shopper] Main product sent to Neon."))
-    .catch(err => console.error("❌ [Smart Shopper] Failed to send main product:", err));
+    }).catch(err => console.error("❌ [Smart Shopper] Failed to send main product:", err));
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ SEND SIMILAR PRODUCTS (RAW URLs ONLY)
+  // SEND SIMILAR PRODUCTS (RAW URLs ONLY)
   // ═══════════════════════════════════════════════════════
 
   function sendSimilarToDB(parentUrl, similarList) {
     if (!parentUrl || !Array.isArray(similarList) || similarList.length === 0) return;
     if (parentUrl === lastSentSimilar) return;
-
     lastSentSimilar = parentUrl;
 
     const payload = similarList.map(s => {
-      // ⭐ تحويل الرابط لرابط عادي فقط (بدون إحالة)
       let rawUrl = s.link || "";
       rawUrl = normalizeToRawUrl(rawUrl);
-
       return {
         parent_url: parentUrl,
         seller_title: s.store || "",
-        product_url: rawUrl,  // ⭐ رابط عادي فقط
+        product_url: rawUrl,
         price: s.price || 0,
         old_price: s.oldPrice || 0,
         discount: s.discount || 0,
@@ -98,7 +158,7 @@
         image_url: s.img || "",
         match_count: s.matchCount || 0
       };
-    }).filter(item => item.product_url); // تجاهل ما لا يحتوي رابطاً
+    }).filter(item => item.product_url);
 
     if (payload.length === 0) return;
 
@@ -107,56 +167,38 @@
       mode: "no-cors",
       headers: { "Content-Type": "text/plain" },
       body: JSON.stringify({ parent_url: parentUrl, items: payload })
-    })
-    .then(() => console.log(`✅ [Smart Shopper] ${payload.length} raw sellers sent to Neon.`))
-    .catch(err => console.error("❌ [Smart Shopper] Failed to send sellers:", err));
+    }).catch(err => console.error("❌ Failed to send sellers:", err));
   }
 
-  // ⭐ إزالة معاملات الإحالة من الرابط (تحويله لرابط عادي)
   function normalizeToRawUrl(url) {
     if (!url) return "";
     try {
-      // إذا كان رابط إحالة (s.click.aliexpress.com)، استخرج الرابط الأصلي إن أمكن
-      if (url.includes("s.click.aliexpress.com") || url.includes("aliexpress.com/e/_")) {
-        // لا يمكن عادةً استخراج الرابط الأصلي من رابط إحالة مباشرة
-        // لكن نخزنه كما هو، وسيولّد رابط إحالة جديد لاحقاً
-        return url;
-      }
-      // رابط عادي → احذف أي معاملات tracking
+      if (url.includes("s.click.aliexpress.com") || url.includes("aliexpress.com/e/_")) return url;
       const u = new URL(url);
-      u.search = ""; // إزالة كل معاملات الاستعلام
+      u.search = "";
       return u.toString();
-    } catch (_) {
-      return url;
-    }
+    } catch (_) { return url; }
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ GENERATE FRESH AFFILIATE LINKS
+  // GENERATE FRESH AFFILIATE LINKS
   // ═══════════════════════════════════════════════════════
 
   async function generateAffiliateLinks(sellersInput) {
     if (!sellersInput || sellersInput.length === 0) return sellersInput;
 
-    // اجمع الروابط العادية فقط
     const rawUrls = sellersInput
       .map(s => s.link)
       .filter(url => url && url.includes("aliexpress") && !url.includes("s.click"));
 
-    if (rawUrls.length === 0) {
-      console.log("[Smart Shopper] لا توجد روابط عادية لتوليد إحالة لها.");
-      return sellersInput;
-    }
+    if (rawUrls.length === 0) return sellersInput.map(s => ({ ...s, displayLink: s.link }));
 
     try {
-      console.log(`[Smart Shopper] توليد روابط إحالة لـ ${rawUrls.length} منتج...`);
-
       const res = await fetch(AFFILIATE_LINK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ urls: rawUrls })
       });
-
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (!data.ok) throw new Error(data.error || "API error");
@@ -166,14 +208,10 @@
 
       return sellersInput.map(s => {
         const affiliate = linkMap[s.link];
-        return {
-          ...s,
-          affiliateLink: affiliate || null,
-          displayLink: affiliate || s.link
-        };
+        return { ...s, affiliateLink: affiliate || null, displayLink: affiliate || s.link };
       });
     } catch (e) {
-      console.warn("[Smart Shopper] فشل توليد روابط الإحالة، استخدام الروابط العادية:", e);
+      console.warn("[Smart Shopper] فشل توليد روابط الإحالة:", e);
       return sellersInput.map(s => ({ ...s, displayLink: s.link }));
     }
   }
@@ -183,24 +221,20 @@
     try {
       const links = apiData?.aliexpress_affiliate_link_generate_response
         ?.resp_result?.result?.promotion_links?.promotion_link || [];
-
       for (const item of links) {
         const sourceUrl = item.source_value || item.source_url;
         const promoUrl = item.promotion_link;
         if (sourceUrl && promoUrl) {
-          // نخزن بأشكال مختلفة للتوافق
           map[sourceUrl] = promoUrl;
           map[normalizeToRawUrl(sourceUrl)] = promoUrl;
         }
       }
-    } catch (e) {
-      console.warn("فشل استخراج الروابط:", e);
-    }
+    } catch (e) { console.warn("فشل استخراج الروابط:", e); }
     return map;
   }
 
   // ═══════════════════════════════════════════════════════
-  // CACHE (localStorage)
+  // CACHE
   // ═══════════════════════════════════════════════════════
 
   function cacheKey(product) { return `ss-cache:${product.url}`; }
@@ -220,18 +254,11 @@
     try { localStorage.removeItem(cacheKey(product)); } catch (_) {}
   }
 
-  // ═══════════════════════════════════════════════════════
-  // ⭐ DB CACHE (Neon)
-  // ═══════════════════════════════════════════════════════
-
   async function loadFromDB(parentUrl) {
     try {
-      const res = await fetch(
-        `${WORKER_URL}/similar?parent_url=${encodeURIComponent(parentUrl)}`
-      );
+      const res = await fetch(`${WORKER_URL}/similar?parent_url=${encodeURIComponent(parentUrl)}`);
       const data = await res.json();
-      const rows = data.rows || [];
-      return rows.map(row => ({
+      return (data.rows || []).map(row => ({
         store: row.seller_title,
         img: row.image_url,
         price: parseFloat(row.price),
@@ -239,26 +266,22 @@
         discount: row.discount,
         rating: parseFloat(row.rating),
         sold: row.sold_count,
-        link: row.product_url,  // ⭐ رابط عادي فقط
+        link: row.product_url,
         matchCount: row.match_count,
         _cachedAt: row.scraped_at
       }));
-    } catch (e) {
-      console.warn("فشل تحميل من DB:", e);
-      return null;
-    }
+    } catch (e) { console.warn("فشل تحميل من DB:", e); return null; }
   }
 
   function isFresh(items) {
     if (!items.length) return false;
     const cachedAt = items[0]._cachedAt;
     if (!cachedAt) return false;
-    const age = Date.now() - new Date(cachedAt).getTime();
-    return age < DB_CACHE_TTL_MS;
+    return (Date.now() - new Date(cachedAt).getTime()) < DB_CACHE_TTL_MS;
   }
 
   // ═══════════════════════════════════════════════════════
-  // CURRENCY
+  // CURRENCY / NUMBERS / FORMAT
   // ═══════════════════════════════════════════════════════
 
   function detectCurrency() {
@@ -291,8 +314,6 @@
       /¥\s*([\d]+\.?\d{0,2})/g,
       /₽\s*([\d]+\.?\d{0,2})/g,
       /₺\s*([\d]+\.?\d{0,2})/g,
-      /₹\s*([\d]+\.?\d{0,2})/g,
-      /₩\s*([\d]+\.?\d{0,2})/g,
     ];
 
     for (const re of patterns) {
@@ -307,7 +328,7 @@
 
   function formatPrice(v, currency) {
     if (v == null) return "—";
-    const symbolMap = { USD: "$", EUR: "€", GBP: "£", SAR: "﷼", DA: "DA ", TRY: "₺", RUB: "₽", CNY: "¥" };
+    const symbolMap = { USD: "$", EUR: "€", GBP: "£", SAR: "﷼", DA: "DA ", TRY: "₺", RUB: "₽", CNY: "¥", DZD: "DA " };
     const sym = symbolMap[currency] || "$";
     const num = v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     return IS_RTL ? `${num} ${sym.trim()}` : `${sym}${num}`;
@@ -351,13 +372,7 @@
 
   function extractBrands(text) {
     if (!text) return [];
-    const brands = [
-      "Sony","JBL","Bose","Samsung","Apple","Xiaomi","Huawei","Anker","Beats",
-      "Sennheiser","Logitech","Razer","Corsair","HyperX","SteelSeries","Philips",
-      "Panasonic","LG","Nike","Adidas","Puma","Reebok","Dyson","Redmi",
-      "POCO","Realme","OnePlus","Oppo","Vivo","Google","Dell","HP","Lenovo","Asus",
-      "Acer","MSI","Toshiba","Canon","Nikon","GoPro","DJI","Fitbit","Garmin"
-    ];
+    const brands = ["Sony","JBL","Bose","Samsung","Apple","Xiaomi","Huawei","Anker","Beats","Sennheiser","Logitech","Razer","Corsair","HyperX","SteelSeries","Philips","Panasonic","LG","Nike","Adidas","Puma","Reebok","Dyson","Redmi","POCO","Realme","OnePlus","Oppo","Vivo","Google","Dell","HP","Lenovo","Asus","Acer","MSI","Toshiba","Canon","Nikon","GoPro","DJI","Fitbit","Garmin"];
     const upper = text.toUpperCase();
     return brands.filter(b => upper.includes(b.toUpperCase()));
   }
@@ -390,9 +405,7 @@
     if (!text || !specs.length) return { matched: 0, total: specs.length, ratio: 0 };
     const upper = text.toUpperCase().replace(/\s+/g, "");
     let matched = 0;
-    for (const s of specs) {
-      if (upper.includes(s.replace(/\s+/g, ""))) matched++;
-    }
+    for (const s of specs) if (upper.includes(s.replace(/\s+/g, ""))) matched++;
     return { matched, total: specs.length, ratio: matched / specs.length };
   }
 
@@ -685,9 +698,7 @@
 
     if (old > 0 && old <= current) old = 0;
     if (discount < 0 || discount > 90) discount = 0;
-    if (!discount && old > current && current > 0) {
-      discount = Math.round((1 - current / old) * 100);
-    }
+    if (!discount && old > current && current > 0) discount = Math.round((1 - current / old) * 100);
     return { price: current, oldPrice: old, discount };
   }
 
@@ -771,12 +782,10 @@
           const matched = currentModels.filter(m => upperTitle.includes(m));
           if (matched.length === 0) { rejectedByModel++; continue; }
         }
-
         if (currentBrands.length > 0) {
           const matched = currentBrands.filter(b => upperTitle.includes(b.toUpperCase()));
           if (matched.length === 0) { rejectedByBrand++; continue; }
         }
-
         const specResult = countSpecMatches(title, currentSpecs);
         if (currentSpecs.length >= 2 && specResult.ratio < 0.7) { rejectedBySpecs++; continue; }
 
@@ -804,7 +813,7 @@
           discount: priceInfo.discount,
           rating,
           sold: sold || 0,
-          link: href,  // ⭐ رابط عادي
+          link: href,
           matchCount,
           modelMatches,
           brandMatches,
@@ -820,10 +829,6 @@
     console.log(`[Smart Shopper] ❌ Rejected → Model: ${rejectedByModel} | Brand: ${rejectedByBrand} | Specs: ${rejectedBySpecs} | Keywords: ${rejectedByKeywords} | Price: ${rejectedByPrice}`);
     return results;
   }
-
-  // ═══════════════════════════════════════════════════════
-  // PICK BEST
-  // ═══════════════════════════════════════════════════════
 
   function pickBest(candidates, cp) {
     if (!candidates.length) return [];
@@ -850,14 +855,22 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // API SEARCH
+  // API SEARCH (with country/currency)
   // ═══════════════════════════════════════════════════════
 
   async function apiSearch(keyword) {
+    // ⭐ اكتشف العملة والبلد من الصفحة
+    const { currency, country } = extractPageCurrencyAndCountry();
+
     const res = await fetch(`${WORKER_URL}/api/search`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ keyword, pageSize: 40 }),
+      body: JSON.stringify({
+        keyword,
+        pageSize: 40,
+        currency: currency,      // ⭐ العملة الفعلية
+        country: country         // ⭐ البلد الفعلي
+      }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const payload = await res.json();
@@ -874,7 +887,6 @@
         price, oldPrice: oldP, discount,
         rating: rating > 0 && rating <= 5 ? +rating.toFixed(1) : 0,
         sold: parseInt(p.lastest_volume || 0, 10),
-        // ⭐ استخدام الرابط العادي (product_detail_url) بدلاً من promotion_link
         link: p.product_detail_url || p.promotion_link || "",
         title: p.product_title || "",
         matchCount: 0,
@@ -907,7 +919,6 @@
     console.log(`[Smart Shopper] Models:`, currentModels);
     console.log(`[Smart Shopper] Brands:`, currentBrands);
     console.log(`[Smart Shopper] Specs:`, currentSpecs);
-    console.log(`[Smart Shopper] Current price:`, cp);
 
     await waitForStablePage(6000);
     await autoScroll();
@@ -920,19 +931,16 @@
       return { source: "page", sellers: best };
     }
 
-    // ⭐ API Fallback with filtering
+    // API Fallback
     const englishWords = (product.title || "").replace(/[^\x00-\x7F\s]/g, "").split(/\s+/)
       .map(w => w.trim().toLowerCase())
       .filter(w => w.length > 3 && !STOP_WORDS.has(w));
-
     englishWords.sort((a, b) => b.length - a.length);
 
     const queries = [];
     if (englishWords.length >= 3) queries.push(englishWords.slice(0, 4).join(" "));
     if (englishWords.length >= 2) queries.push(englishWords.slice(0, 3).join(" "));
     if (englishWords.length >= 2) queries.push(englishWords.slice(1, 4).join(" "));
-
-    console.log(`[Smart Shopper] API Queries:`, queries);
 
     for (const q of queries) {
       try {
@@ -958,10 +966,7 @@
         console.log(`[Smart Shopper] API strict filtered: ${strict.length} of ${items.length}`);
 
         if (strict.length >= 1) {
-          const enriched = strict.map(it => ({
-            ...it,
-            matchCount: countMatches(it.title || it.store, currentKeywords)
-          }));
+          const enriched = strict.map(it => ({ ...it, matchCount: countMatches(it.title || it.store, currentKeywords) }));
           saveCache(product, enriched, "api");
           return { source: "api", sellers: enriched };
         }
@@ -1025,7 +1030,7 @@
     panel.querySelector("[data-action='refresh']").addEventListener("click", async () => {
       if (isScanning) return;
       clearCache(currentProduct);
-      lastSentSimilar = "";  // ⭐ إعادة الإرسال للـ DB عند التحديث
+      lastSentSimilar = "";
       await doScan(true);
     });
     panel.querySelector("#ss-filters").addEventListener("click", (e) => {
@@ -1043,7 +1048,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ DO SCAN — Cache-first strategy
+  // DO SCAN
   // ═══════════════════════════════════════════════════════
 
   async function doScan(forceRescan = false) {
@@ -1056,11 +1061,9 @@
       if (!forceRescan) {
         const dbCached = await loadFromDB(currentProduct.url);
         if (dbCached && dbCached.length > 0 && isFresh(dbCached)) {
-          console.log(`✅ [Smart Shopper] ${dbCached.length} نتيجة من Cache (توفير).`);
+          console.log(`⚡ [Smart Shopper] ${dbCached.length} نتيجة من Cache (توفير).`);
 
-          // ⭐ 2. ولّد روابط إحالة جديدة من الروابط العادية
           sellers = await generateAffiliateLinks(dbCached);
-
           dataSource = "cache";
           updateSourceLabel();
           renderList();
@@ -1069,14 +1072,13 @@
         }
       }
 
-      // 3. لا يوجد Cache → ابحث عادةً
+      // 2. لا يوجد Cache → ابحث عادةً
       const result = await buildSellerList(currentProduct, forceRescan);
       sellers = result.sellers;
       dataSource = result.source;
       updateSourceLabel();
       renderList();
 
-      // 4. خزّن في DB (روابط عادية فقط)
       if (sellers.length > 0) {
         sendSimilarToDB(currentProduct.url, sellers);
       }
@@ -1095,7 +1097,7 @@
     const map = {
       page: T("sameProduct"),
       api: T("similarApi"),
-      cache: "⚡ Cache",   // عرض سريع عند استخدام Cache
+      cache: "⚡ Cache",
       none: T("noAlt")
     };
     el.textContent = map[dataSource] || T("scanning");
@@ -1199,7 +1201,6 @@
       `;
     }).join("");
 
-    // ⭐ استخدام رابط الإحالة عند النقر
     list.querySelectorAll(".ss-row").forEach(row => {
       row.addEventListener("click", () => {
         const item = items[+row.dataset.idx];
@@ -1292,6 +1293,11 @@
 
     currentProduct = extractProduct();
     console.log("[Smart Shopper] Product:", currentProduct);
+
+    // ⭐ عرض البلد والعملة المكتشفين
+    const pageInfo = extractPageCurrencyAndCountry();
+    console.log(`[Smart Shopper] سيرسل الطلبات بـ: ${pageInfo.currency} / ${pageInfo.country}`);
+
     if (!currentProduct.title || currentProduct.title.length < 5) return;
     if (!currentProduct.price || currentProduct.price <= 0) return;
 
@@ -1319,7 +1325,7 @@
         const product = extractProduct();
         if (product.title && product.title.length > 5 && product.price > 0) {
           currentProduct = product;
-          lastSentSimilar = "";  // ⭐ إعادة تفعيل إرسال المنتجات المشابهة للمنتج الجديد
+          lastSentSimilar = "";
           sendProductToDB(product);
         }
       }, 3000);
@@ -1327,5 +1333,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v28 ready.`);
+  console.log(`[Smart Shopper] v29 ready.`);
 })();
