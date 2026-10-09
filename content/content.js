@@ -1,9 +1,8 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v25)
-   Focus: Find OTHER SELLERS of the SAME product.
-   Strict matching: high title overlap + model numbers + price range.
-   Full i18n support via T() translation function.
-   + Guard: only runs on product pages (/item/ or /i/).
+   Smart Shopper — Content Script (v26)
+   Focus: Find OTHER SELLERS of the EXACT SAME product.
+   Strict matching: model + brand + specs + keywords + price.
+   Design and filters preserved unchanged.
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -16,7 +15,7 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v25 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v26 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
@@ -180,26 +179,82 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // MODEL NUMBER EXTRACTION
+  // ⭐ PRODUCT ID / MODEL / BRAND / SPECS EXTRACTION
   // ═══════════════════════════════════════════════════════
+
+  function extractProductId(url) {
+    if (!url) return null;
+    const m = url.match(/\/item\/(\d+)\.html/);
+    return m ? m[1] : null;
+  }
 
   function extractModelNumbers(text) {
     if (!text) return [];
     const models = new Set();
     const patterns = [
-      /\b([A-Z]{1,3}[\s-]?\d{2,5}[A-Z]?)\b/g,
-      /\b([A-Z]\d{3,5})\b/g,
+      /\b([A-Z]{1,4}[\s-]?\d{2,5}[A-Z]?)\b/g,          // E88, XR15, WH-1000XM5
+      /\b([A-Z]\d{3,5}[A-Z]?)\b/g,                      // A1234
+      /\b(iPhone\s*\d{1,2}\s*(Pro|Max|Plus|Mini)?)\b/gi,
+      /\b(Galaxy\s*[A-Z]\d{1,2}\s*(Ultra|Plus)?)\b/gi,
+      /\b(Redmi\s*Note\s*\d{1,2}\s*(Pro)?)\b/gi,
       /\b(Pro|Plus|Max|Ultra|Lite|Mini|SE)\b/gi,
-      /\b(\d{1,3}\s*(?:GB|TB|ml|L|W|V|mAh))\b/gi,
+      /\b(\d{1,3}\s*(?:GB|TB|ml|mAh))\b/gi,
     ];
     for (const re of patterns) {
       let m;
       while ((m = re.exec(text)) !== null) {
-        const v = m[1].toUpperCase().replace(/\s+/g, "");
-        if (v.length >= 2) models.add(v);
+        const v = m[1].toUpperCase().replace(/\s+/g, " ").trim();
+        if (v.length >= 2 && v.length <= 25) models.add(v);
       }
     }
     return [...models];
+  }
+
+  function extractBrands(text) {
+    if (!text) return [];
+    const brands = [
+      "Sony","JBL","Bose","Samsung","Apple","Xiaomi","Huawei","Anker","Beats",
+      "Sennheiser","Logitech","Razer","Corsair","HyperX","SteelSeries","Philips",
+      "Panasonic","LG","Nike","Adidas","Puma","Reebok","Dyson","Redmi",
+      "POCO","Realme","OnePlus","Oppo","Vivo","Google","Dell","HP","Lenovo","Asus",
+      "Acer","MSI","Toshiba","Canon","Nikon","GoPro","DJI","Fitbit","Garmin"
+    ];
+    const upper = text.toUpperCase();
+    return brands.filter(b => upper.includes(b.toUpperCase()));
+  }
+
+  function extractSpecs(text) {
+    if (!text) return [];
+    const specs = new Set();
+    const patterns = [
+      /\b(\d{1,4})\s*(GB|TB)\b/gi,
+      /\b(\d{1,5})\s*(mAh)\b/gi,
+      /\b(\d{1,3})\s*(W|V|Hz|kHz)\b/gi,
+      /\b(\d{1,3})\s*(mm|cm|inch|in)\b/gi,
+      /\b(4K|8K|1080P|2K|HD|UHD)\b/gi,
+      /\b(5G|4G|LTE|WiFi|Wi-Fi|BT|Bluetooth)\s*(\d(?:\.\d)?)?\b/gi,
+      /\b(IP[X]?\d{1,2})\b/gi,
+      /\b(USB|Type-?C|Micro-?USB)\s*(\d(?:\.\d)?)?\b/gi,
+      /\b(ANC|ENC|TWS|HDR|NFC|GPS)\b/gi,
+    ];
+    for (const re of patterns) {
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const v = m[0].toUpperCase().replace(/\s+/g, "");
+        specs.add(v);
+      }
+    }
+    return [...specs];
+  }
+
+  function countSpecMatches(text, specs) {
+    if (!text || !specs.length) return { matched: 0, total: specs.length, ratio: 0 };
+    const upper = text.toUpperCase().replace(/\s+/g, "");
+    let matched = 0;
+    for (const s of specs) {
+      if (upper.includes(s.replace(/\s+/g, ""))) matched++;
+    }
+    return { matched, total: specs.length, ratio: matched / specs.length };
   }
 
   function modelMatchCount(text, models) {
@@ -551,20 +606,29 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // MAIN SCRAPER — strict matching for same product
+  // ⭐ STRICT SCRAPER — only EXACT same product
   // ═══════════════════════════════════════════════════════
 
-  function collectCandidates(currentKeywords, currentModels, cp) {
+  function collectCandidates(currentKeywords, currentModels, currentBrands, currentSpecs, cp) {
     const results = [];
     const seen = new Set();
     const currentUrl = location.href.split("?")[0];
+    const currentProductId = extractProductId(currentUrl);
     const links = document.querySelectorAll("a[href*='/item/']");
     console.log(`[Smart Shopper] Scanning ${links.length} links`);
+    console.log(`[Smart Shopper] Reference → Models:`, currentModels, `| Brands:`, currentBrands, `| Specs:`, currentSpecs);
+
+    let rejectedByModel = 0, rejectedByBrand = 0, rejectedBySpecs = 0, rejectedByKeywords = 0, rejectedByPrice = 0;
 
     for (const link of links) {
       try {
         const href = link.href.split("?")[0];
         if (!href || href === currentUrl || seen.has(href)) continue;
+
+        // ⭐ استبعاد المنتج الأصلي بالمعرّف
+        const candidateId = extractProductId(href);
+        if (currentProductId && candidateId && currentProductId === candidateId) continue;
+
         const card = findCardContainer(link);
         if (!card) continue;
         const img = extractRealImage(card);
@@ -574,18 +638,42 @@
         const title = extractTitleFromCard(card);
         if (!title || title.length < 8) continue;
 
+        const upperTitle = title.toUpperCase();
+
+        // ─── الشرط 1: الموديل ───
+        if (currentModels.length > 0) {
+          const matched = currentModels.filter(m => upperTitle.includes(m));
+          if (matched.length === 0) { rejectedByModel++; continue; }
+        }
+
+        // ─── الشرط 2: العلامة التجارية ───
+        if (currentBrands.length > 0) {
+          const matched = currentBrands.filter(b => upperTitle.includes(b.toUpperCase()));
+          if (matched.length === 0) { rejectedByBrand++; continue; }
+        }
+
+        // ─── الشرط 3: المواصفات التقنية (70%+) ───
+        const specResult = countSpecMatches(title, currentSpecs);
+        if (currentSpecs.length >= 2 && specResult.ratio < 0.7) { rejectedBySpecs++; continue; }
+
+        // ─── الشرط 4: الكلمات المشتركة ───
         const matchCount = countMatches(title, currentKeywords);
-        const modelMatches = modelMatchCount(title, currentModels);
+        const totalKeywords = currentKeywords.length;
+        const matchRatio = totalKeywords > 0 ? matchCount / totalKeywords : 0;
+        const isStrictKeywordMatch = matchCount >= 4 || (totalKeywords <= 5 && matchCount >= 3) || matchRatio >= 0.6;
+        if (!isStrictKeywordMatch) { rejectedByKeywords++; continue; }
+
+        // ─── الشرط 5: نطاق السعر (60%-160%) ───
         const priceRatio = cp ? priceInfo.price / cp : 1;
-
-        const isStrictMatch = matchCount >= 3 || (matchCount >= 2 && modelMatches >= 1);
-        if (!isStrictMatch) continue;
-
-        if (cp && (priceRatio < 0.5 || priceRatio > 2.0)) continue;
+        if (cp && (priceRatio < 0.6 || priceRatio > 1.6)) { rejectedByPrice++; continue; }
 
         const sold = extractSoldFromCard(card);
         const rating = extractRatingFromCard(card);
         seen.add(href);
+
+        const modelMatches = currentModels.length > 0 ? currentModels.filter(m => upperTitle.includes(m)).length : 0;
+        const brandMatches = currentBrands.length > 0 ? currentBrands.filter(b => upperTitle.includes(b.toUpperCase())).length : 0;
+
         results.push({
           store: shortenTitle(title),
           img,
@@ -597,11 +685,17 @@
           link: href,
           matchCount,
           modelMatches,
+          brandMatches,
+          specMatches: specResult.matched,
+          specTotal: specResult.total,
+          specRatio: specResult.ratio,
           priceRatio
         });
       } catch (_) {}
     }
-    console.log(`[Smart Shopper] Strict candidates: ${results.length}`);
+
+    console.log(`[Smart Shopper] ✅ Accepted: ${results.length}`);
+    console.log(`[Smart Shopper] ❌ Rejected → Model: ${rejectedByModel} | Brand: ${rejectedByBrand} | Specs: ${rejectedBySpecs} | Keywords: ${rejectedByKeywords} | Price: ${rejectedByPrice}`);
     return results;
   }
 
@@ -614,8 +708,10 @@
 
     const scored = candidates.map(c => {
       let score = 0;
-      score += c.modelMatches * 40;
-      score += c.matchCount * 15;
+      score += c.modelMatches * 50;
+      score += c.brandMatches * 30;
+      score += c.specRatio * 100;
+      score += c.matchCount * 12;
       if (cp && cp > 0) {
         const ratio = c.priceRatio;
         if (ratio >= 0.85 && ratio <= 1.15) score += 30;
@@ -660,6 +756,8 @@
         title: p.product_title || "",
         matchCount: 0,
         modelMatches: 0,
+        brandMatches: 0,
+        specRatio: 0,
         priceRatio: 1
       };
     }).filter(s => s.price > 0 && s.img);
@@ -678,16 +776,20 @@
     }
     const currentKeywords = keywords(product.title);
     const currentModels = extractModelNumbers(product.title);
+    const currentBrands = extractBrands(product.title);
+    const currentSpecs = extractSpecs(product.title);
     const cp = product?.price;
 
     console.log(`[Smart Shopper] Keywords:`, currentKeywords.slice(0, 8));
     console.log(`[Smart Shopper] Models:`, currentModels);
+    console.log(`[Smart Shopper] Brands:`, currentBrands);
+    console.log(`[Smart Shopper] Specs:`, currentSpecs);
     console.log(`[Smart Shopper] Current price:`, cp);
 
     await waitForStablePage(6000);
     await autoScroll();
 
-    const candidates = collectCandidates(currentKeywords, currentModels, cp);
+    const candidates = collectCandidates(currentKeywords, currentModels, currentBrands, currentSpecs, cp);
     const best = pickBest(candidates, cp);
 
     if (best.length >= 1) {
@@ -712,7 +814,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // PANEL
+  // PANEL (تصميم لم يتغير)
   // ═══════════════════════════════════════════════════════
 
   function buildPanel() {
@@ -993,7 +1095,6 @@
   async function run() {
     await sleep(1500);
 
-    // ⭐ الحماية الإضافية: تجاهل الصفحات التي ليست صفحات منتج
     if (!location.href.includes("/item/") && !location.href.includes("/i/")) {
       console.log("[Smart Shopper] ليس صفحة منتج، تم التخطي.");
       return;
@@ -1022,7 +1123,6 @@
     const url = location.href;
     if (url !== lastUrl) {
       lastUrl = url;
-      // ⭐ نفس الحماية عند التنقل
       if (!url.includes("/item/") && !url.includes("/i/")) return;
 
       setTimeout(() => {
@@ -1036,5 +1136,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v25 ready.`);
+  console.log(`[Smart Shopper] v26 ready.`);
 })();
