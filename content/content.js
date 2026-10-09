@@ -1,7 +1,9 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v27)
-   Strict matching + Smart API fallback (with filtering).
-   Design and filters preserved unchanged.
+   Smart Shopper — Content Script (v28)
+   - Cache-first strategy (saves Bright Data costs)
+   - Stores only raw URLs in DB
+   - Generates fresh affiliate links on display
+   - Strict matching for EXACT same product
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -14,13 +16,15 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v27 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v28 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
   const DB_WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/product";
   const DB_SIMILAR_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/similar";
+  const AFFILIATE_LINK_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/api/link";
   const CACHE_TTL = 1000 * 60 * 30;
+  const DB_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 أيام
 
   let currentProduct = null;
   let sellers = [];
@@ -32,7 +36,7 @@
   let lastSentSimilar = "";
 
   // ═══════════════════════════════════════════════════════
-  // SEND PRODUCT TO NEON DB
+  // ⭐ SEND MAIN PRODUCT TO NEON
   // ═══════════════════════════════════════════════════════
 
   function sendProductToDB(product) {
@@ -67,24 +71,36 @@
     .catch(err => console.error("❌ [Smart Shopper] Failed to send main product:", err));
   }
 
+  // ═══════════════════════════════════════════════════════
+  // ⭐ SEND SIMILAR PRODUCTS (RAW URLs ONLY)
+  // ═══════════════════════════════════════════════════════
+
   function sendSimilarToDB(parentUrl, similarList) {
     if (!parentUrl || !Array.isArray(similarList) || similarList.length === 0) return;
     if (parentUrl === lastSentSimilar) return;
 
     lastSentSimilar = parentUrl;
 
-    const payload = similarList.map(s => ({
-      parent_url: parentUrl,
-      seller_title: s.store || "",
-      product_url: s.link || "",
-      price: s.price || 0,
-      old_price: s.oldPrice || 0,
-      discount: s.discount || 0,
-      rating: s.rating || 0,
-      sold_count: s.sold || 0,
-      image_url: s.img || "",
-      match_count: s.matchCount || 0
-    }));
+    const payload = similarList.map(s => {
+      // ⭐ تحويل الرابط لرابط عادي فقط (بدون إحالة)
+      let rawUrl = s.link || "";
+      rawUrl = normalizeToRawUrl(rawUrl);
+
+      return {
+        parent_url: parentUrl,
+        seller_title: s.store || "",
+        product_url: rawUrl,  // ⭐ رابط عادي فقط
+        price: s.price || 0,
+        old_price: s.oldPrice || 0,
+        discount: s.discount || 0,
+        rating: s.rating || 0,
+        sold_count: s.sold || 0,
+        image_url: s.img || "",
+        match_count: s.matchCount || 0
+      };
+    }).filter(item => item.product_url); // تجاهل ما لا يحتوي رابطاً
+
+    if (payload.length === 0) return;
 
     fetch(DB_SIMILAR_URL, {
       method: "POST",
@@ -92,12 +108,99 @@
       headers: { "Content-Type": "text/plain" },
       body: JSON.stringify({ parent_url: parentUrl, items: payload })
     })
-    .then(() => console.log(`✅ [Smart Shopper] ${payload.length} sellers sent to Neon.`))
+    .then(() => console.log(`✅ [Smart Shopper] ${payload.length} raw sellers sent to Neon.`))
     .catch(err => console.error("❌ [Smart Shopper] Failed to send sellers:", err));
   }
 
+  // ⭐ إزالة معاملات الإحالة من الرابط (تحويله لرابط عادي)
+  function normalizeToRawUrl(url) {
+    if (!url) return "";
+    try {
+      // إذا كان رابط إحالة (s.click.aliexpress.com)، استخرج الرابط الأصلي إن أمكن
+      if (url.includes("s.click.aliexpress.com") || url.includes("aliexpress.com/e/_")) {
+        // لا يمكن عادةً استخراج الرابط الأصلي من رابط إحالة مباشرة
+        // لكن نخزنه كما هو، وسيولّد رابط إحالة جديد لاحقاً
+        return url;
+      }
+      // رابط عادي → احذف أي معاملات tracking
+      const u = new URL(url);
+      u.search = ""; // إزالة كل معاملات الاستعلام
+      return u.toString();
+    } catch (_) {
+      return url;
+    }
+  }
+
   // ═══════════════════════════════════════════════════════
-  // CACHE
+  // ⭐ GENERATE FRESH AFFILIATE LINKS
+  // ═══════════════════════════════════════════════════════
+
+  async function generateAffiliateLinks(sellersInput) {
+    if (!sellersInput || sellersInput.length === 0) return sellersInput;
+
+    // اجمع الروابط العادية فقط
+    const rawUrls = sellersInput
+      .map(s => s.link)
+      .filter(url => url && url.includes("aliexpress") && !url.includes("s.click"));
+
+    if (rawUrls.length === 0) {
+      console.log("[Smart Shopper] لا توجد روابط عادية لتوليد إحالة لها.");
+      return sellersInput;
+    }
+
+    try {
+      console.log(`[Smart Shopper] توليد روابط إحالة لـ ${rawUrls.length} منتج...`);
+
+      const res = await fetch(AFFILIATE_LINK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urls: rawUrls })
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "API error");
+
+      const linkMap = extractAffiliateLinkMap(data.data);
+      console.log(`[Smart Shopper] تم توليد ${Object.keys(linkMap).length} رابط إحالة.`);
+
+      return sellersInput.map(s => {
+        const affiliate = linkMap[s.link];
+        return {
+          ...s,
+          affiliateLink: affiliate || null,
+          displayLink: affiliate || s.link
+        };
+      });
+    } catch (e) {
+      console.warn("[Smart Shopper] فشل توليد روابط الإحالة، استخدام الروابط العادية:", e);
+      return sellersInput.map(s => ({ ...s, displayLink: s.link }));
+    }
+  }
+
+  function extractAffiliateLinkMap(apiData) {
+    const map = {};
+    try {
+      const links = apiData?.aliexpress_affiliate_link_generate_response
+        ?.resp_result?.result?.promotion_links?.promotion_link || [];
+
+      for (const item of links) {
+        const sourceUrl = item.source_value || item.source_url;
+        const promoUrl = item.promotion_link;
+        if (sourceUrl && promoUrl) {
+          // نخزن بأشكال مختلفة للتوافق
+          map[sourceUrl] = promoUrl;
+          map[normalizeToRawUrl(sourceUrl)] = promoUrl;
+        }
+      }
+    } catch (e) {
+      console.warn("فشل استخراج الروابط:", e);
+    }
+    return map;
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // CACHE (localStorage)
   // ═══════════════════════════════════════════════════════
 
   function cacheKey(product) { return `ss-cache:${product.url}`; }
@@ -115,6 +218,43 @@
   }
   function clearCache(product) {
     try { localStorage.removeItem(cacheKey(product)); } catch (_) {}
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // ⭐ DB CACHE (Neon)
+  // ═══════════════════════════════════════════════════════
+
+  async function loadFromDB(parentUrl) {
+    try {
+      const res = await fetch(
+        `${WORKER_URL}/similar?parent_url=${encodeURIComponent(parentUrl)}`
+      );
+      const data = await res.json();
+      const rows = data.rows || [];
+      return rows.map(row => ({
+        store: row.seller_title,
+        img: row.image_url,
+        price: parseFloat(row.price),
+        oldPrice: parseFloat(row.old_price),
+        discount: row.discount,
+        rating: parseFloat(row.rating),
+        sold: row.sold_count,
+        link: row.product_url,  // ⭐ رابط عادي فقط
+        matchCount: row.match_count,
+        _cachedAt: row.scraped_at
+      }));
+    } catch (e) {
+      console.warn("فشل تحميل من DB:", e);
+      return null;
+    }
+  }
+
+  function isFresh(items) {
+    if (!items.length) return false;
+    const cachedAt = items[0]._cachedAt;
+    if (!cachedAt) return false;
+    const age = Date.now() - new Date(cachedAt).getTime();
+    return age < DB_CACHE_TTL_MS;
   }
 
   // ═══════════════════════════════════════════════════════
@@ -178,7 +318,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // PRODUCT ID / MODEL / BRAND / SPECS EXTRACTION
+  // PRODUCT ID / MODEL / BRAND / SPECS
   // ═══════════════════════════════════════════════════════
 
   function extractProductId(url) {
@@ -605,7 +745,6 @@
     const currentProductId = extractProductId(currentUrl);
     const links = document.querySelectorAll("a[href*='/item/']");
     console.log(`[Smart Shopper] Scanning ${links.length} links`);
-    console.log(`[Smart Shopper] Reference → Models:`, currentModels, `| Brands:`, currentBrands, `| Specs:`, currentSpecs);
 
     let rejectedByModel = 0, rejectedByBrand = 0, rejectedBySpecs = 0, rejectedByKeywords = 0, rejectedByPrice = 0;
 
@@ -665,7 +804,7 @@
           discount: priceInfo.discount,
           rating,
           sold: sold || 0,
-          link: href,
+          link: href,  // ⭐ رابط عادي
           matchCount,
           modelMatches,
           brandMatches,
@@ -683,7 +822,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // PICK BEST SELLERS (strict)
+  // PICK BEST
   // ═══════════════════════════════════════════════════════
 
   function pickBest(candidates, cp) {
@@ -735,7 +874,8 @@
         price, oldPrice: oldP, discount,
         rating: rating > 0 && rating <= 5 ? +rating.toFixed(1) : 0,
         sold: parseInt(p.lastest_volume || 0, 10),
-        link: p.promotion_link || p.product_detail_url || "",
+        // ⭐ استخدام الرابط العادي (product_detail_url) بدلاً من promotion_link
+        link: p.product_detail_url || p.promotion_link || "",
         title: p.product_title || "",
         matchCount: 0,
         modelMatches: 0,
@@ -780,15 +920,13 @@
       return { source: "page", sellers: best };
     }
 
-    // ⭐ API Fallback مع فلترة صارمة واختيار ذكي للكلمات
+    // ⭐ API Fallback with filtering
     const englishWords = (product.title || "").replace(/[^\x00-\x7F\s]/g, "").split(/\s+/)
       .map(w => w.trim().toLowerCase())
       .filter(w => w.length > 3 && !STOP_WORDS.has(w));
 
-    // الترتيب حسب الطول (الكلمات الطويلة عادة أكثر تحديداً)
     englishWords.sort((a, b) => b.length - a.length);
 
-    // بناء 3 محاولات بحث بكلمات مختلفة
     const queries = [];
     if (englishWords.length >= 3) queries.push(englishWords.slice(0, 4).join(" "));
     if (englishWords.length >= 2) queries.push(englishWords.slice(0, 3).join(" "));
@@ -801,36 +939,25 @@
         const items = await apiSearch(q);
         if (items.length === 0) continue;
 
-        // ⭐ فلترة صارمة لنتائج API
         const strict = items.filter(it => {
           const upperTitle = (it.title || it.store || "").toUpperCase();
-
-          // نفس الموديل (إن وُجد)
           if (currentModels.length > 0) {
             const hasModel = currentModels.some(m => upperTitle.includes(m));
             if (!hasModel) return false;
           }
-
-          // نفس العلامة (إن وُجدت)
           if (currentBrands.length > 0) {
             const hasBrand = currentBrands.some(b => upperTitle.includes(b.toUpperCase()));
             if (!hasBrand) return false;
           }
-
-          // كلمات مشتركة كافية
           const matchCount = countMatches(it.title || it.store, currentKeywords);
           if (matchCount < 4 && (currentKeywords.length > 5 || matchCount < 3)) return false;
-
-          // السعر ضمن نطاق مقبول
           if (cp && (it.price < cp * 0.5 || it.price > cp * 1.8)) return false;
-
           return true;
         });
 
         console.log(`[Smart Shopper] API strict filtered: ${strict.length} of ${items.length}`);
 
         if (strict.length >= 1) {
-          // إضافة معلومات المطابقة لكل نتيجة
           const enriched = strict.map(it => ({
             ...it,
             matchCount: countMatches(it.title || it.store, currentKeywords)
@@ -841,12 +968,11 @@
       } catch (e) { console.warn(e); }
     }
 
-    // ⭐ لا نتائج صالحة → نُعيد قائمة فارغة (أفضل من نتائج خاطئة)
     return { source: "none", sellers: [] };
   }
 
   // ═══════════════════════════════════════════════════════
-  // PANEL (تصميم لم يتغير)
+  // PANEL
   // ═══════════════════════════════════════════════════════
 
   function buildPanel() {
@@ -899,6 +1025,7 @@
     panel.querySelector("[data-action='refresh']").addEventListener("click", async () => {
       if (isScanning) return;
       clearCache(currentProduct);
+      lastSentSimilar = "";  // ⭐ إعادة الإرسال للـ DB عند التحديث
       await doScan(true);
     });
     panel.querySelector("#ss-filters").addEventListener("click", (e) => {
@@ -915,17 +1042,41 @@
     renderLoading();
   }
 
+  // ═══════════════════════════════════════════════════════
+  // ⭐ DO SCAN — Cache-first strategy
+  // ═══════════════════════════════════════════════════════
+
   async function doScan(forceRescan = false) {
     if (isScanning) return;
     isScanning = true;
     renderLoading();
+
     try {
+      // ⭐ 1. جرّب قاعدة البيانات أولاً (Cache)
+      if (!forceRescan) {
+        const dbCached = await loadFromDB(currentProduct.url);
+        if (dbCached && dbCached.length > 0 && isFresh(dbCached)) {
+          console.log(`✅ [Smart Shopper] ${dbCached.length} نتيجة من Cache (توفير).`);
+
+          // ⭐ 2. ولّد روابط إحالة جديدة من الروابط العادية
+          sellers = await generateAffiliateLinks(dbCached);
+
+          dataSource = "cache";
+          updateSourceLabel();
+          renderList();
+          isScanning = false;
+          return;
+        }
+      }
+
+      // 3. لا يوجد Cache → ابحث عادةً
       const result = await buildSellerList(currentProduct, forceRescan);
       sellers = result.sellers;
       dataSource = result.source;
       updateSourceLabel();
       renderList();
 
+      // 4. خزّن في DB (روابط عادية فقط)
       if (sellers.length > 0) {
         sendSimilarToDB(currentProduct.url, sellers);
       }
@@ -941,7 +1092,12 @@
   function updateSourceLabel() {
     const el = document.getElementById("ss-source");
     if (!el) return;
-    const map = { page: T("sameProduct"), api: T("similarApi"), none: T("noAlt") };
+    const map = {
+      page: T("sameProduct"),
+      api: T("similarApi"),
+      cache: "⚡ Cache",   // عرض سريع عند استخدام Cache
+      none: T("noAlt")
+    };
     el.textContent = map[dataSource] || T("scanning");
   }
 
@@ -989,7 +1145,7 @@
         <button id="ss-retry" style="background:#09090b;color:#fff;border:none;padding:7px 14px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;font-family:inherit;">${T("scanAgain")}</button>
       </div>
     `;
-    document.getElementById("ss-retry")?.addEventListener("click", () => { clearCache(currentProduct); doScan(true); });
+    document.getElementById("ss-retry")?.addEventListener("click", () => { clearCache(currentProduct); lastSentSimilar = ""; doScan(true); });
   }
 
   function renderList() {
@@ -1043,10 +1199,12 @@
       `;
     }).join("");
 
+    // ⭐ استخدام رابط الإحالة عند النقر
     list.querySelectorAll(".ss-row").forEach(row => {
       row.addEventListener("click", () => {
         const item = items[+row.dataset.idx];
-        if (item?.link) window.open(item.link, "_blank", "noopener");
+        const url = item?.displayLink || item?.affiliateLink || item?.link;
+        if (url) window.open(url, "_blank", "noopener");
       });
     });
   }
@@ -1161,6 +1319,7 @@
         const product = extractProduct();
         if (product.title && product.title.length > 5 && product.price > 0) {
           currentProduct = product;
+          lastSentSimilar = "";  // ⭐ إعادة تفعيل إرسال المنتجات المشابهة للمنتج الجديد
           sendProductToDB(product);
         }
       }, 3000);
@@ -1168,5 +1327,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v27 ready.`);
+  console.log(`[Smart Shopper] v28 ready.`);
 })();
