@@ -1,10 +1,8 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v30)
-   - BUILD PANEL FIRST (before any risky operation)
-   - Safe currency/country detection (all in try/catch)
-   - Cache-first strategy
-   - Stores only raw URLs
-   - Generates fresh affiliate links on display
+   Smart Shopper — Content Script (v31)
+   - Cache-first
+   - Real prices fetched from server (zero client data)
+   - Strict matching
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -17,15 +15,17 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v30 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v31 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
   const DB_WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/product";
   const DB_SIMILAR_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/similar";
   const AFFILIATE_LINK_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/api/link";
+  const REAL_PRICES_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/real-prices-batch";
   const CACHE_TTL = 1000 * 60 * 30;
   const DB_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  const REAL_PRICE_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
 
   let currentProduct = null;
   let sellers = [];
@@ -37,59 +37,98 @@
   let lastSentSimilar = "";
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ DETECT CURRENCY & COUNTRY (SAFE)
+  // ⭐ REAL PRICE CACHE (7 days)
   // ═══════════════════════════════════════════════════════
 
-  function extractPageCurrencyAndCountry() {
-    const result = { currency: "USD", country: "US" };
+  const REAL_PRICE_CACHE_KEY = "ss-real-prices";
 
+  function loadRealPriceCache() {
     try {
-      const currencyEls = document.querySelectorAll(
-        "[class*='currency'], [class*='Currency'], [data-currency], [class*='ship-to']"
-      );
-      for (const el of currencyEls) {
-        if (!el) continue;
-        const txt = (el.innerText || el.getAttribute("data-currency") || "").trim().toUpperCase();
-        const m = txt.match(/\b(USD|EUR|GBP|DZD|SAR|AED|TRY|RUB|CNY|JPY|KRW|BRL|MXN|CAD|AUD|INR)\b/);
-        if (m) { result.currency = m[1]; break; }
+      const raw = localStorage.getItem(REAL_PRICE_CACHE_KEY);
+      if (!raw) return {};
+      const data = JSON.parse(raw);
+      const now = Date.now();
+      const filtered = {};
+      for (const [url, entry] of Object.entries(data)) {
+        if (entry.ts && (now - entry.ts) < REAL_PRICE_CACHE_TTL) filtered[url] = entry;
       }
-    } catch (e) { /* ignore */ }
+      return filtered;
+    } catch (_) { return {}; }
+  }
 
-    try {
-      if (result.currency === "USD") {
-        const cm = document.cookie.match(/(?:aep_currency|currency|_currency)=([A-Z]{3})/);
-        if (cm) result.currency = cm[1];
+  function saveRealPriceCache(cache) {
+    try { localStorage.setItem(REAL_PRICE_CACHE_KEY, JSON.stringify(cache)); } catch (_) {}
+  }
+
+  function setCachedRealPrice(url, price, currency) {
+    const cache = loadRealPriceCache();
+    cache[url] = { price, currency, ts: Date.now() };
+    saveRealPriceCache(cache);
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // ⭐ FETCH REAL PRICES FROM SERVER (zero client cost)
+  // ═══════════════════════════════════════════════════════
+
+  async function fetchRealPricesBatch(sellersList) {
+    if (!sellersList || sellersList.length === 0) return;
+
+    const cache = loadRealPriceCache();
+    let cachedCount = 0;
+    const needFetch = [];
+
+    for (const s of sellersList) {
+      const url = s.link;
+      if (!url || !url.includes("/item/")) continue;
+
+      if (cache[url] && cache[url].price > 0) {
+        s.price = cache[url].price;
+        if (cache[url].currency) s.currency = cache[url].currency;
+        s._realPrice = true;
+        cachedCount++;
+      } else {
+        needFetch.push(s);
       }
-    } catch (e) { /* ignore */ }
-
-    try {
-      if (result.currency === "USD") {
-        const ls = localStorage.getItem("aep_currency") || localStorage.getItem("currency");
-        if (ls && /^[A-Z]{3}$/.test(ls)) result.currency = ls;
-      }
-    } catch (e) { /* ignore */ }
-
-    const currencyToCountry = {
-      USD: "US", EUR: "FR", GBP: "GB", DZD: "DZ", SAR: "SA",
-      AED: "AE", TRY: "TR", RUB: "RU", CNY: "CN", JPY: "JP",
-      KRW: "KR", BRL: "BR", MXN: "MX", CAD: "CA", AUD: "AU", INR: "IN"
-    };
-
-    try {
-      const shipEls = document.querySelectorAll("[class*='shipTo'], [class*='ship-to'], [class*='country']");
-      for (const el of shipEls) {
-        if (!el) continue;
-        const txt = (el.innerText || "").trim();
-        const m = txt.match(/\b(US|FR|GB|DE|ES|IT|DZ|SA|AE|TR|RU|CN|JP|KR|BR|MX|CA|AU|IN)\b/);
-        if (m) { result.country = m[1]; break; }
-      }
-    } catch (e) { /* ignore */ }
-
-    if (!result.country || result.country === "US") {
-      result.country = currencyToCountry[result.currency] || "US";
     }
 
-    return result;
+    if (cachedCount > 0) {
+      console.log(`[Smart Shopper] ✅ ${cachedCount} سعر من Cache.`);
+      renderList();
+    }
+    if (needFetch.length === 0) return;
+
+    const urls = needFetch.slice(0, 8).map(s => s.link);
+    console.log(`[Smart Shopper] 🌐 طلب ${urls.length} سعر من السيرفر (بدون استهلاك جهازك)...`);
+
+    try {
+      const res = await fetch(REAL_PRICES_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urls })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "API error");
+
+      let updated = 0;
+      for (const s of needFetch) {
+        const found = data.results[s.link];
+        if (found && found.success && found.price > 0) {
+          s.price = found.price;
+          if (found.currency) s.currency = found.currency;
+          s._realPrice = true;
+          setCachedRealPrice(s.link, found.price, found.currency);
+          updated++;
+        }
+      }
+
+      if (updated > 0) {
+        console.log(`✅ [Smart Shopper] تم تحديث ${updated} سعر حقيقي من السيرفر.`);
+        renderList();
+      }
+    } catch (e) {
+      console.warn("[Smart Shopper] فشل قراءة الأسعار:", e);
+    }
   }
 
   // ═══════════════════════════════════════════════════════
@@ -100,7 +139,6 @@
     if (!product || !product.url) return;
     if (!product.price || product.price <= 0) return;
     if (product.url === lastSentUrl) return;
-
     lastSentUrl = product.url;
 
     try {
@@ -125,13 +163,11 @@
           discount: null
         })
       }).catch(err => console.warn("فشل إرسال المنتج:", err));
-    } catch (e) {
-      console.warn("فشل fetch المنتج:", e);
-    }
+    } catch (e) { /* ignore */ }
   }
 
   // ═══════════════════════════════════════════════════════
-  // SEND SIMILAR PRODUCTS (RAW URLs ONLY)
+  // SEND SIMILAR PRODUCTS (RAW URLs only)
   // ═══════════════════════════════════════════════════════
 
   function sendSimilarToDB(parentUrl, similarList) {
@@ -140,22 +176,18 @@
     lastSentSimilar = parentUrl;
 
     try {
-      const payload = similarList.map(s => {
-        let rawUrl = s.link || "";
-        rawUrl = normalizeToRawUrl(rawUrl);
-        return {
-          parent_url: parentUrl,
-          seller_title: s.store || "",
-          product_url: rawUrl,
-          price: s.price || 0,
-          old_price: s.oldPrice || 0,
-          discount: s.discount || 0,
-          rating: s.rating || 0,
-          sold_count: s.sold || 0,
-          image_url: s.img || "",
-          match_count: s.matchCount || 0
-        };
-      }).filter(item => item.product_url);
+      const payload = similarList.map(s => ({
+        parent_url: parentUrl,
+        seller_title: s.store || "",
+        product_url: normalizeToRawUrl(s.link || ""),
+        price: s.price || 0,
+        old_price: s.oldPrice || 0,
+        discount: s.discount || 0,
+        rating: s.rating || 0,
+        sold_count: s.sold || 0,
+        image_url: s.img || "",
+        match_count: s.matchCount || 0
+      })).filter(item => item.product_url);
 
       if (payload.length === 0) return;
 
@@ -165,9 +197,7 @@
         headers: { "Content-Type": "text/plain" },
         body: JSON.stringify({ parent_url: parentUrl, items: payload })
       }).catch(err => console.warn("فشل إرسال المنتجات المشابهة:", err));
-    } catch (e) {
-      console.warn("فشل تجهيز بيانات المنتجات المشابهة:", e);
-    }
+    } catch (e) { /* ignore */ }
   }
 
   function normalizeToRawUrl(url) {
@@ -186,11 +216,7 @@
 
   async function generateAffiliateLinks(sellersInput) {
     if (!sellersInput || sellersInput.length === 0) return sellersInput;
-
-    const rawUrls = sellersInput
-      .map(s => s.link)
-      .filter(url => url && url.includes("aliexpress") && !url.includes("s.click"));
-
+    const rawUrls = sellersInput.map(s => s.link).filter(url => url && url.includes("aliexpress") && !url.includes("s.click"));
     if (rawUrls.length === 0) return sellersInput.map(s => ({ ...s, displayLink: s.link }));
 
     try {
@@ -204,14 +230,11 @@
       if (!data.ok) throw new Error(data.error || "API error");
 
       const linkMap = extractAffiliateLinkMap(data.data);
-      console.log(`[Smart Shopper] تم توليد ${Object.keys(linkMap).length} رابط إحالة.`);
-
       return sellersInput.map(s => {
         const affiliate = linkMap[s.link];
         return { ...s, affiliateLink: affiliate || null, displayLink: affiliate || s.link };
       });
     } catch (e) {
-      console.warn("[Smart Shopper] فشل توليد روابط الإحالة:", e);
       return sellersInput.map(s => ({ ...s, displayLink: s.link }));
     }
   }
@@ -270,7 +293,7 @@
         matchCount: row.match_count,
         _cachedAt: row.scraped_at
       }));
-    } catch (e) { console.warn("فشل تحميل من DB:", e); return null; }
+    } catch (e) { return null; }
   }
 
   function isFresh(items) {
@@ -281,7 +304,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // CURRENCY / NUMBERS / FORMAT
+  // CURRENCY
   // ═══════════════════════════════════════════════════════
 
   function detectCurrency() {
@@ -303,7 +326,6 @@
       .replace(/[٠-٩]/g, d => String("٠١٢٣٤٥٦٧٨٩".indexOf(d)))
       .replace(/[۰-۹]/g, d => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)))
       .replace(/[,\u066C\u00A0]/g, "");
-
     const results = [];
     const patterns = [
       /US\s*\$\s*([\d]+\.?\d{0,2})/g,
@@ -315,7 +337,6 @@
       /₽\s*([\d]+\.?\d{0,2})/g,
       /₺\s*([\d]+\.?\d{0,2})/g,
     ];
-
     for (const re of patterns) {
       let m;
       while ((m = re.exec(normalized)) !== null) {
@@ -550,9 +571,7 @@
     const srcset = img.getAttribute("srcset");
     if (srcset) {
       const entries = srcset.split(",").map(s => s.trim().split(" ")[0]);
-      for (let i = entries.length - 1; i >= 0; i--) {
-        if (!isBadImage(entries[i])) return entries[i];
-      }
+      for (let i = entries.length - 1; i >= 0; i--) if (!isBadImage(entries[i])) return entries[i];
     }
     const dataSrc = img.getAttribute("data-src");
     if (dataSrc && !isBadImage(dataSrc)) return dataSrc.startsWith("//") ? "https:" + dataSrc : dataSrc;
@@ -569,7 +588,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // AUTO-SCROLL
+  // AUTO-SCROLL / WAIT
   // ═══════════════════════════════════════════════════════
 
   async function autoScroll() {
@@ -656,7 +675,6 @@
 
     const priceEls = card.querySelectorAll("[class*='price'], [class*='Price']");
     let current = 0, old = 0;
-
     for (const el of priceEls) {
       const cls = (el.className || "").toString().toLowerCase();
       const style = (el.getAttribute("style") || "").toLowerCase();
@@ -674,11 +692,8 @@
 
     if (old > 0 && discount > 0 && discount < 90) {
       const expected = old * (1 - discount / 100);
-      if (!current || Math.abs(current - expected) / expected > 0.4) {
-        current = Math.round(expected * 100) / 100;
-      }
+      if (!current || Math.abs(current - expected) / expected > 0.4) current = Math.round(expected * 100) / 100;
     }
-
     if (!current) {
       const numbers = extractNumbers(txt);
       const valid = [];
@@ -695,7 +710,6 @@
         if (valid.length > 1 && current / valid[0] > 1.15) old = current;
       }
     }
-
     if (old > 0 && old <= current) old = 0;
     if (discount < 0 || discount > 90) discount = 0;
     if (!discount && old > current && current > 0) discount = Math.round((1 - current / old) * 100);
@@ -755,18 +769,13 @@
     const currentUrl = location.href.split("?")[0];
     const currentProductId = extractProductId(currentUrl);
     const links = document.querySelectorAll("a[href*='/item/']");
-    console.log(`[Smart Shopper] Scanning ${links.length} links`);
-
-    let rejectedByModel = 0, rejectedByBrand = 0, rejectedBySpecs = 0, rejectedByKeywords = 0, rejectedByPrice = 0;
 
     for (const link of links) {
       try {
         const href = link.href.split("?")[0];
         if (!href || href === currentUrl || seen.has(href)) continue;
-
         const candidateId = extractProductId(href);
         if (currentProductId && candidateId && currentProductId === candidateId) continue;
-
         const card = findCardContainer(link);
         if (!card) continue;
         const img = extractRealImage(card);
@@ -777,62 +786,46 @@
         if (!title || title.length < 8) continue;
 
         const upperTitle = title.toUpperCase();
-
         if (currentModels.length > 0) {
           const matched = currentModels.filter(m => upperTitle.includes(m));
-          if (matched.length === 0) { rejectedByModel++; continue; }
+          if (matched.length === 0) continue;
         }
         if (currentBrands.length > 0) {
           const matched = currentBrands.filter(b => upperTitle.includes(b.toUpperCase()));
-          if (matched.length === 0) { rejectedByBrand++; continue; }
+          if (matched.length === 0) continue;
         }
         const specResult = countSpecMatches(title, currentSpecs);
-        if (currentSpecs.length >= 2 && specResult.ratio < 0.7) { rejectedBySpecs++; continue; }
+        if (currentSpecs.length >= 2 && specResult.ratio < 0.7) continue;
 
         const matchCount = countMatches(title, currentKeywords);
         const totalKeywords = currentKeywords.length;
         const matchRatio = totalKeywords > 0 ? matchCount / totalKeywords : 0;
         const isStrictKeywordMatch = matchCount >= 4 || (totalKeywords <= 5 && matchCount >= 3) || matchRatio >= 0.6;
-        if (!isStrictKeywordMatch) { rejectedByKeywords++; continue; }
+        if (!isStrictKeywordMatch) continue;
 
         const priceRatio = cp ? priceInfo.price / cp : 1;
-        if (cp && (priceRatio < 0.6 || priceRatio > 1.6)) { rejectedByPrice++; continue; }
+        if (cp && (priceRatio < 0.6 || priceRatio > 1.6)) continue;
 
         const sold = extractSoldFromCard(card);
         const rating = extractRatingFromCard(card);
         seen.add(href);
-
         const modelMatches = currentModels.length > 0 ? currentModels.filter(m => upperTitle.includes(m)).length : 0;
         const brandMatches = currentBrands.length > 0 ? currentBrands.filter(b => upperTitle.includes(b.toUpperCase())).length : 0;
 
         results.push({
           store: shortenTitle(title),
-          img,
-          price: priceInfo.price,
-          oldPrice: priceInfo.oldPrice,
-          discount: priceInfo.discount,
-          rating,
-          sold: sold || 0,
-          link: href,
-          matchCount,
-          modelMatches,
-          brandMatches,
-          specMatches: specResult.matched,
-          specTotal: specResult.total,
-          specRatio: specResult.ratio,
-          priceRatio
+          img, price: priceInfo.price, oldPrice: priceInfo.oldPrice, discount: priceInfo.discount,
+          rating, sold: sold || 0, link: href, matchCount, modelMatches, brandMatches,
+          specMatches: specResult.matched, specTotal: specResult.total, specRatio: specResult.ratio, priceRatio
         });
       } catch (_) {}
     }
-
     console.log(`[Smart Shopper] ✅ Accepted: ${results.length}`);
-    console.log(`[Smart Shopper] ❌ Rejected → Model: ${rejectedByModel} | Brand: ${rejectedByBrand} | Specs: ${rejectedBySpecs} | Keywords: ${rejectedByKeywords} | Price: ${rejectedByPrice}`);
     return results;
   }
 
   function pickBest(candidates, cp) {
     if (!candidates.length) return [];
-
     const scored = candidates.map(c => {
       let score = 0;
       score += c.modelMatches * 50;
@@ -849,30 +842,19 @@
       if (c.discount > 20) score += 2;
       return { ...c, _score: score };
     });
-
     scored.sort((a, b) => (b._score !== a._score ? b._score - a._score : a.price - b.price));
     return scored.slice(0, 50);
   }
 
   // ═══════════════════════════════════════════════════════
-  // API SEARCH (with country/currency)
+  // API SEARCH
   // ═══════════════════════════════════════════════════════
 
   async function apiSearch(keyword) {
-    let pageInfo = { currency: "USD", country: "US" };
-    try {
-      pageInfo = extractPageCurrencyAndCountry();
-    } catch (e) { /* ignore */ }
-
     const res = await fetch(`${WORKER_URL}/api/search`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        keyword,
-        pageSize: 40,
-        currency: pageInfo.currency,
-        country: pageInfo.country
-      }),
+      body: JSON.stringify({ keyword, pageSize: 40, currency: "USD", country: "US" }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const payload = await res.json();
@@ -891,11 +873,7 @@
         sold: parseInt(p.lastest_volume || 0, 10),
         link: p.product_detail_url || p.promotion_link || "",
         title: p.product_title || "",
-        matchCount: 0,
-        modelMatches: 0,
-        brandMatches: 0,
-        specRatio: 0,
-        priceRatio: 1
+        matchCount: 0, modelMatches: 0, brandMatches: 0, specRatio: 0, priceRatio: 1
       };
     }).filter(s => s.price > 0 && s.img);
   }
@@ -907,20 +885,13 @@
   async function buildSellerList(product, forceRescan = false) {
     if (!forceRescan) {
       const cached = loadCache(product);
-      if (cached && cached.sellers.length) {
-        return { source: cached.source, sellers: cached.sellers, fromCache: true };
-      }
+      if (cached && cached.sellers.length) return { source: cached.source, sellers: cached.sellers, fromCache: true };
     }
     const currentKeywords = keywords(product.title);
     const currentModels = extractModelNumbers(product.title);
     const currentBrands = extractBrands(product.title);
     const currentSpecs = extractSpecs(product.title);
     const cp = product?.price;
-
-    console.log(`[Smart Shopper] Keywords:`, currentKeywords.slice(0, 8));
-    console.log(`[Smart Shopper] Models:`, currentModels);
-    console.log(`[Smart Shopper] Brands:`, currentBrands);
-    console.log(`[Smart Shopper] Specs:`, currentSpecs);
 
     await waitForStablePage(6000);
     await autoScroll();
@@ -947,25 +918,15 @@
       try {
         const items = await apiSearch(q);
         if (items.length === 0) continue;
-
         const strict = items.filter(it => {
           const upperTitle = (it.title || it.store || "").toUpperCase();
-          if (currentModels.length > 0) {
-            const hasModel = currentModels.some(m => upperTitle.includes(m));
-            if (!hasModel) return false;
-          }
-          if (currentBrands.length > 0) {
-            const hasBrand = currentBrands.some(b => upperTitle.includes(b.toUpperCase()));
-            if (!hasBrand) return false;
-          }
+          if (currentModels.length > 0 && !currentModels.some(m => upperTitle.includes(m))) return false;
+          if (currentBrands.length > 0 && !currentBrands.some(b => upperTitle.includes(b.toUpperCase()))) return false;
           const matchCount = countMatches(it.title || it.store, currentKeywords);
           if (matchCount < 4 && (currentKeywords.length > 5 || matchCount < 3)) return false;
           if (cp && (it.price < cp * 0.5 || it.price > cp * 1.8)) return false;
           return true;
         });
-
-        console.log(`[Smart Shopper] API strict filtered: ${strict.length} of ${items.length}`);
-
         if (strict.length >= 1) {
           const enriched = strict.map(it => ({ ...it, matchCount: countMatches(it.title || it.store, currentKeywords) }));
           saveCache(product, enriched, "api");
@@ -1000,6 +961,7 @@
             </div>
           </div>
           <div class="ss-header-actions">
+            <button class="ss-btn-icon" data-action="fetch-real-prices" title="تحديث الأسعار الحقيقية">💱</button>
             <button class="ss-btn-icon" data-action="refresh" title="Refresh">↻</button>
             <button class="ss-btn-icon" data-action="minimize">−</button>
             <button class="ss-btn-icon" data-action="close">×</button>
@@ -1035,6 +997,10 @@
         lastSentSimilar = "";
         await doScan(true);
       });
+      panel.querySelector("[data-action='fetch-real-prices']").addEventListener("click", async () => {
+        if (isScanning || !sellers.length) return;
+        await fetchRealPricesBatch(sellers);
+      });
       panel.querySelector("#ss-filters").addEventListener("click", (e) => {
         const chip = e.target.closest(".ss-chip");
         if (!chip) return;
@@ -1047,16 +1013,10 @@
       restorePanelPosition(panel);
       renderCurrentProduct();
       renderLoading();
-
-      console.log("[Smart Shopper] ✅ اللوحة العائمة ظهرت.");
     } catch (e) {
       console.error("[Smart Shopper] فشل بناء اللوحة:", e);
     }
   }
-
-  // ═══════════════════════════════════════════════════════
-  // DO SCAN
-  // ═══════════════════════════════════════════════════════
 
   async function doScan(forceRescan = false) {
     if (isScanning) return;
@@ -1067,8 +1027,6 @@
       if (!forceRescan) {
         const dbCached = await loadFromDB(currentProduct.url);
         if (dbCached && dbCached.length > 0 && isFresh(dbCached)) {
-          console.log(`⚡ [Smart Shopper] ${dbCached.length} نتيجة من Cache (توفير).`);
-
           sellers = await generateAffiliateLinks(dbCached);
           dataSource = "cache";
           updateSourceLabel();
@@ -1084,9 +1042,7 @@
       updateSourceLabel();
       renderList();
 
-      if (sellers.length > 0) {
-        sendSimilarToDB(currentProduct.url, sellers);
-      }
+      if (sellers.length > 0) sendSimilarToDB(currentProduct.url, sellers);
     } catch (e) {
       console.error("[Smart Shopper] Scan failed:", e);
       sellers = [];
@@ -1099,12 +1055,7 @@
   function updateSourceLabel() {
     const el = document.getElementById("ss-source");
     if (!el) return;
-    const map = {
-      page: T("sameProduct"),
-      api: T("similarApi"),
-      cache: "⚡ Cache",
-      none: T("noAlt")
-    };
+    const map = { page: T("sameProduct"), api: T("similarApi"), cache: "⚡ Cache", none: T("noAlt") };
     el.textContent = map[dataSource] || T("scanning");
   }
 
@@ -1184,6 +1135,7 @@
       const soldHtml = s.sold > 0 ? `<span class="ss-sold">${fmt(s.sold)} ${T("sold")}</span>` : "";
       const metaItems = [ratingHtml, soldHtml].filter(Boolean).join('<span class="ss-sep">·</span>');
       const saveStr = pricePercent > 0 ? `−${pricePercent}%` : (pricePercent < 0 ? `+${Math.abs(pricePercent)}%` : "");
+      const realBadge = s._realPrice ? `<span class="ss-real-price" title="سعر حقيقي">✓</span>` : "";
 
       return `
         <div class="ss-row ${rowClass}" data-idx="${i}">
@@ -1197,6 +1149,7 @@
           <div class="ss-price-col">
             <div class="ss-price-line">
               <span class="ss-price-now">${formatPrice(s.price, currentProduct?.currency)}</span>
+              ${realBadge}
               ${discountBadge}
             </div>
             ${oldPriceHtml ? `<div class="ss-old-line">${oldPriceHtml}</div>` : ""}
@@ -1291,43 +1244,24 @@
   async function run() {
     await sleep(1500);
 
-    if (!location.href.includes("/item/") && !location.href.includes("/i/")) {
-      console.log("[Smart Shopper] ليس صفحة منتج، تم التخطي.");
-      return;
+    if (!location.href.includes("/item/") && !location.href.includes("/i/")) return;
+
+    let attempts = 0;
+    while (attempts < 15) {
+      attempts++;
+      try {
+        currentProduct = extractProduct();
+        if (currentProduct && currentProduct.title && currentProduct.title.length >= 5 && currentProduct.price > 0) break;
+      } catch (_) {}
+      await sleep(1500);
     }
 
-    // ⭐ 1. استخرج المنتج أولاً
-    try {
-      currentProduct = extractProduct();
-      console.log("[Smart Shopper] Product:", currentProduct);
-    } catch (e) {
-      console.error("[Smart Shopper] فشل استخراج المنتج:", e);
-      return;
-    }
+    if (!currentProduct || !currentProduct.title || !currentProduct.price || currentProduct.price <= 0) return;
 
-    if (!currentProduct.title || currentProduct.title.length < 5) return;
-    if (!currentProduct.price || currentProduct.price <= 0) return;
-
-    // ⭐ 2. ابنِ اللوحة أولاً (لا شيء يمنعها)
     buildPanel();
-
-    // ⭐ 3. استخرج العملة والبلد بعدها (مع حماية)
-    try {
-      const pageInfo = extractPageCurrencyAndCountry();
-      console.log(`[Smart Shopper] 💱 ${pageInfo.currency} | 🌍 ${pageInfo.country}`);
-    } catch (e) {
-      console.warn("[Smart Shopper] فشل استخراج العملة:", e);
-    }
-
-    // ⭐ 4. أرسل بيانات المنتج
     sendProductToDB(currentProduct);
 
-    // ⭐ 5. ابدأ المسح
-    try {
-      await doScan(false);
-    } catch (e) {
-      console.error("[Smart Shopper] فشل المسح:", e);
-    }
+    try { await doScan(false); } catch (e) { console.error(e); }
   }
 
   chrome.runtime.onMessage.addListener((msg, _s, res) => {
@@ -1344,7 +1278,6 @@
     if (url !== lastUrl) {
       lastUrl = url;
       if (!url.includes("/item/") && !url.includes("/i/")) return;
-
       setTimeout(() => {
         try {
           const product = extractProduct();
@@ -1352,6 +1285,8 @@
             currentProduct = product;
             lastSentSimilar = "";
             sendProductToDB(product);
+            buildPanel();
+            doScan(false);
           }
         } catch (_) {}
       }, 3000);
@@ -1359,5 +1294,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v30 ready.`);
+  console.log(`[Smart Shopper] v31 ready.`);
 })();
