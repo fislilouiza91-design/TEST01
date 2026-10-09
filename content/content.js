@@ -1,6 +1,7 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v24)
-   Sends main product + similar products to Neon DB.
+   Smart Shopper — Content Script (v25)
+   Focus: Find OTHER SELLERS of the SAME product.
+   Stricter matching: high title overlap + model numbers + price range.
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -13,7 +14,7 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v24 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v25 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
@@ -31,7 +32,7 @@
   let lastSentSimilar = "";
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ SEND MAIN PRODUCT TO NEON DB
+  // SEND PRODUCT TO NEON DB
   // ═══════════════════════════════════════════════════════
 
   function sendProductToDB(product) {
@@ -63,12 +64,8 @@
       })
     })
     .then(() => console.log("✅ [Smart Shopper] تم إرسال المنتج الرئيسي إلى Neon."))
-    .catch(err => console.error("❌ [Smart Shopper] فشل إرسال المنتج الرئيسي:", err));
+    .catch(err => console.error("❌ فشل الإرسال:", err));
   }
-
-  // ═══════════════════════════════════════════════════════
-  // ⭐ SEND SIMILAR PRODUCTS TO NEON DB
-  // ═══════════════════════════════════════════════════════
 
   function sendSimilarToDB(parentUrl, similarList) {
     if (!parentUrl || !Array.isArray(similarList) || similarList.length === 0) return;
@@ -93,13 +90,10 @@
       method: "POST",
       mode: "no-cors",
       headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({
-        parent_url: parentUrl,
-        items: payload
-      })
+      body: JSON.stringify({ parent_url: parentUrl, items: payload })
     })
-    .then(() => console.log(`✅ [Smart Shopper] تم إرسال ${payload.length} منتج مشابه إلى Neon.`))
-    .catch(err => console.error("❌ [Smart Shopper] فشل إرسال المنتجات المشابهة:", err));
+    .then(() => console.log(`✅ [Smart Shopper] تم إرسال ${payload.length} بائع إلى Neon.`))
+    .catch(err => console.error("❌ فشل الإرسال:", err));
   }
 
   // ═══════════════════════════════════════════════════════
@@ -157,8 +151,6 @@
       /¥\s*([\d]+\.?\d{0,2})/g,
       /₽\s*([\d]+\.?\d{0,2})/g,
       /₺\s*([\d]+\.?\d{0,2})/g,
-      /₹\s*([\d]+\.?\d{0,2})/g,
-      /₩\s*([\d]+\.?\d{0,2})/g,
     ];
 
     for (const re of patterns) {
@@ -173,21 +165,48 @@
 
   function formatPrice(v, currency) {
     if (v == null) return "—";
-    const symbolMap = {
-      USD: "$", EUR: "€", GBP: "£", SAR: "﷼",
-      DA: "DA ", TRY: "₺", RUB: "₽", CNY: "¥",
-    };
+    const symbolMap = { USD: "$", EUR: "€", GBP: "£", SAR: "﷼", DA: "DA ", TRY: "₺", RUB: "₽", CNY: "¥" };
     const sym = symbolMap[currency] || "$";
     const num = v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     return IS_RTL ? `${num} ${sym.trim()}` : `${sym}${num}`;
   }
 
-  // ═══════════════════════════════════════════════════════
-  // EXCLUSION CONTEXT
-  // ═══════════════════════════════════════════════════════
-
   function isExcludedContext(ctx) {
     return /(pieces|pcs|piece|bulk|wholesale|minimum|per piece|\d+\s*\+|installment|x\s*\$|×\s*\$|off\s+on|off\s+us|save|saving|coupon|discount\s+\$|reduction|with\s+coins|extra\s+%|tax)/i.test(ctx);
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // ⭐ MODEL NUMBER EXTRACTION (جديد)
+  // ═══════════════════════════════════════════════════════
+
+  function extractModelNumbers(text) {
+    if (!text) return [];
+    const models = new Set();
+    // أنماط مثل: E88, A7, XR-15, BK2000, iPhone 15, S23 Ultra
+    const patterns = [
+      /\b([A-Z]{1,3}[\s-]?\d{2,5}[A-Z]?)\b/g,      // E88, XR15, BK-2000
+      /\b([A-Z]\d{3,5})\b/g,                        // A1234
+      /\b(Pro|Plus|Max|Ultra|Lite|Mini|SE)\b/gi,    // Pro, Max, Ultra
+      /\b(\d{1,3}\s*(?:GB|TB|ml|L|W|V|mAh))\b/gi,   // 256GB, 500ml, 20W
+    ];
+    for (const re of patterns) {
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const v = m[1].toUpperCase().replace(/\s+/g, "");
+        if (v.length >= 2) models.add(v);
+      }
+    }
+    return [...models];
+  }
+
+  function modelMatchCount(text, models) {
+    if (!text || !models.length) return 0;
+    const upper = text.toUpperCase();
+    let count = 0;
+    for (const m of models) {
+      if (upper.includes(m)) count++;
+    }
+    return count;
   }
 
   // ═══════════════════════════════════════════════════════
@@ -199,9 +218,7 @@
       const scripts = document.querySelectorAll('script[type="application/ld+json"]');
       for (const s of scripts) {
         const data = JSON.parse(s.textContent || "{}");
-        const offer = data.offers
-          ? (Array.isArray(data.offers) ? data.offers[0] : data.offers)
-          : null;
+        const offer = data.offers ? (Array.isArray(data.offers) ? data.offers[0] : data.offers) : null;
         if (offer?.price) {
           const v = parseFloat(offer.price);
           if (v > 0.5) return { price: v, currency: offer.priceCurrency || "USD" };
@@ -209,11 +226,7 @@
       }
     } catch (_) {}
 
-    const metaSels = [
-      "meta[property='product:price:amount']",
-      "meta[property='og:price:amount']",
-      "meta[itemprop='price']",
-    ];
+    const metaSels = ["meta[property='product:price:amount']", "meta[property='og:price:amount']", "meta[itemprop='price']"];
     for (const sel of metaSels) {
       const m = document.querySelector(sel);
       if (m) {
@@ -224,7 +237,6 @@
 
     const allPriceEls = document.querySelectorAll("[class*='price'], [class*='Price']");
     const candidates = [];
-
     for (const el of allPriceEls) {
       const cls = (el.className || "").toString().toLowerCase();
       const style = (el.getAttribute("style") || "").toLowerCase();
@@ -232,22 +244,16 @@
       if (/line-through/.test(style)) continue;
       if (/(coupon|off|save|discount|reduce|promo|voucher)/i.test(cls)) continue;
       if (/(bulk|wholesale|minimum|quantity|tier)/i.test(cls)) continue;
-
       const txt = (el.innerText || "").trim();
-      if (!txt) continue;
-      if (isExcludedContext(txt)) continue;
-
+      if (!txt || isExcludedContext(txt)) continue;
       const nums = extractNumbers(txt);
       if (!nums.length) continue;
-
       const value = nums[0].value;
       if (value < 3) continue;
-
       const isCurrent = /(current|sale|now|main|primary|actual)/i.test(cls);
       const fontSize = parseFloat(window.getComputedStyle(el).fontSize) || 12;
-      candidates.push({ value, isCurrent, fontSize, el });
+      candidates.push({ value, isCurrent, fontSize });
     }
-
     if (candidates.length) {
       candidates.sort((a, b) => {
         if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
@@ -255,41 +261,6 @@
       });
       return { price: candidates[0].value, currency: detectCurrency() };
     }
-
-    const h1 = document.querySelector("h1[data-pl='product-title'], .product-title-text, h1.product-title");
-    if (h1) {
-      let node = h1;
-      for (let i = 0; i < 6 && node; i++) {
-        node = node.parentElement;
-        if (!node) break;
-        const txt = node.innerText || "";
-        if (txt.length > 3000) continue;
-        const nums = extractNumbers(txt);
-        const valid = nums
-          .filter(n => n.value >= 3)
-          .filter(n => {
-            const s = Math.max(0, n.index - 70);
-            const e = Math.min(txt.length, n.index + 80);
-            return !isExcludedContext(txt.slice(s, e));
-          });
-        if (valid.length) {
-          valid.sort((a, b) => b.value - a.value);
-          return { price: valid[0].value, currency: detectCurrency() };
-        }
-      }
-    }
-
-    const top40 = (document.body.innerText || "").slice(0, 4000);
-    const nums = extractNumbers(top40).filter(n => n.value >= 3).filter(n => {
-      const s = Math.max(0, n.index - 70);
-      const e = Math.min(top40.length, n.index + 80);
-      return !isExcludedContext(top40.slice(s, e));
-    });
-    if (nums.length) {
-      nums.sort((a, b) => b.value - a.value);
-      return { price: nums[0].value, currency: detectCurrency() };
-    }
-
     return { price: null, currency: "USD" };
   }
 
@@ -298,14 +269,7 @@
   // ═══════════════════════════════════════════════════════
 
   function getTitle() {
-    const sels = [
-      "h1[data-pl='product-title']",
-      ".product-title-text",
-      ".pdp-comp-title",
-      "[class*='title--wrap'] h1",
-      "[class*='product-title']",
-      "h1.product-title",
-    ];
+    const sels = ["h1[data-pl='product-title']", ".product-title-text", ".pdp-comp-title", "[class*='title--wrap'] h1", "[class*='product-title']", "h1.product-title"];
     for (const sel of sels) {
       const el = document.querySelector(sel);
       if (el) {
@@ -351,16 +315,6 @@
         if (r > 0 && r <= 5) return r;
       }
     }
-    const sels = ["[class*='reviewer--rating']", ".pdp-review-rating", "[class*='rating--value']"];
-    for (const sel of sels) {
-      const el = document.querySelector(sel);
-      if (!el) continue;
-      const m = (el.innerText || "").match(/([0-5](?:\.\d+)?)/);
-      if (m) {
-        const r = parseFloat(m[1]);
-        if (r > 0 && r <= 5) return r;
-      }
-    }
     return null;
   }
 
@@ -387,7 +341,6 @@
     if (!src || !src.startsWith("http")) return true;
     const low = src.toLowerCase();
     for (const p of BAD_PATTERNS) if (low.includes(p)) return true;
-    if (low.includes(".svg") && low.length < 300) return true;
     return false;
   }
 
@@ -471,8 +424,6 @@
     "for","with","and","the","a","an","of","to","in","on","at","by","is","original","new","hot","sale","free","shipping","best","top","quality","high","wholesale","dropshipping","factory","brand","genuine","fast","delivery","1pc","2pcs","3pcs","pcs","set","pack","style","type","you","your","this","that","from","into","only","more","all","any","good","great","item","product","pieces","piece",
     "من","في","على","إلى","مع","عن","هذا","هذه","ذلك","التي","الذي","أو","و","ثم","لكن","حتى","بعد","قبل","كل","بعض","أي","لا","ما","هو","هي","كان","يكون","جدا","أكثر","أقل","جديد","جديدة","الأصلي","الأصلية","الآن","اليوم","سعر","أسعار","شحن","مجاني","مجانا","بيع","شراء","منتج","منتجات","عالية","جودة","أفضل","أحسن","رخيص","حديث","حديثة","متطور","متطورة","قابل","قابلة",
     "pour","avec","et","le","la","les","un","une","des","de","du","au","ce","cette","ces","son","sa","ses","dans","sur","par","vers","est","sont","être","avoir","très","plus","moins","tout","tous","nouveau","nouvelle","original","meilleur","haute","qualité","livraison","gratuit","vente","produit","produits","prix",
-    "para","con","y","el","la","los","las","un","una","de","del","al","este","esta","en","por","es","son","ser","estar","muy","más","menos","todo","todos","nuevo","nueva","mejor","alta","calidad","envío","gratis","venta","producto","productos",
-    "für","mit","und","der","die","das","den","dem","des","ein","eine","einem","eines","dieser","diese","dieses","auf","zu","nach","ist","sind","sein","haben","sehr","mehr","weniger","alle","neu","neue","original","beste","bester","hohe","qualität","versand","kostenlos","verkauf","produkt","produkte",
   ]);
 
   function keywords(text) {
@@ -492,7 +443,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // CARD PRICE EXTRACTION
+  // CARD SCRAPING
   // ═══════════════════════════════════════════════════════
 
   function extractPriceInfoFromCard(card) {
@@ -502,8 +453,7 @@
     if (dMatch) discount = parseInt(dMatch[1], 10);
 
     const priceEls = card.querySelectorAll("[class*='price'], [class*='Price']");
-    let current = 0;
-    let old = 0;
+    let current = 0, old = 0;
 
     for (const el of priceEls) {
       const cls = (el.className || "").toString().toLowerCase();
@@ -540,10 +490,7 @@
       if (valid.length) {
         valid.sort((a, b) => a - b);
         current = valid[valid.length - 1];
-        if (valid.length > 1) {
-          const lowest = valid[0];
-          if (current / lowest > 1.15) old = current;
-        }
+        if (valid.length > 1 && current / valid[0] > 1.15) old = current;
       }
     }
 
@@ -585,17 +532,8 @@
       const r = parseFloat(m[1] || m[2]);
       if (r > 0 && r <= 5) return r;
     }
-    const m2 = txt.match(/([4-5][.,]\d)/);
-    if (m2) {
-      const r = parseFloat(m2[1].replace(",", "."));
-      if (r > 3 && r <= 5) return r;
-    }
     return 0;
   }
-
-  // ═══════════════════════════════════════════════════════
-  // SCRAPER
-  // ═══════════════════════════════════════════════════════
 
   function findCardContainer(link) {
     let cur = link;
@@ -607,7 +545,11 @@
     return null;
   }
 
-  function collectCandidates(currentKeywords) {
+  // ═══════════════════════════════════════════════════════
+  // ⭐ MAIN SCRAPER — strict matching for same product
+  // ═══════════════════════════════════════════════════════
+
+  function collectCandidates(currentKeywords, currentModels, cp) {
     const results = [];
     const seen = new Set();
     const currentUrl = location.href.split("?")[0];
@@ -626,7 +568,20 @@
         if (!priceInfo.price) continue;
         const title = extractTitleFromCard(card);
         if (!title || title.length < 8) continue;
+
+        // ⭐ حسابات المطابقة
         const matchCount = countMatches(title, currentKeywords);
+        const modelMatches = modelMatchCount(title, currentModels);
+        const priceRatio = cp ? priceInfo.price / cp : 1;
+
+        // ⭐ فلترة صارمة: يجب أن يطابق 3 كلمات على الأقل
+        //   أو يطابق 2 كلمات + موديل
+        const isStrictMatch = matchCount >= 3 || (matchCount >= 2 && modelMatches >= 1);
+        if (!isStrictMatch) continue;
+
+        // ⭐ فلترة السعر: يجب أن يكون ضمن 50%-200%
+        if (cp && (priceRatio < 0.5 || priceRatio > 2.0)) continue;
+
         const sold = extractSoldFromCard(card);
         const rating = extractRatingFromCard(card);
         seen.add(href);
@@ -640,50 +595,44 @@
           sold: sold || 0,
           link: href,
           matchCount,
+          modelMatches,
+          priceRatio
         });
       } catch (_) {}
     }
-    console.log(`[Smart Shopper] Candidates: ${results.length}`);
+    console.log(`[Smart Shopper] Strict candidates: ${results.length}`);
     return results;
   }
 
   // ═══════════════════════════════════════════════════════
-  // PICK BEST
+  // ⭐ PICK BEST SELLERS (strict)
   // ═══════════════════════════════════════════════════════
 
   function pickBest(candidates, cp) {
     if (!candidates.length) return [];
-    let relevant = candidates.filter(c => c.matchCount >= 2);
-    if (relevant.length < 2) {
-      relevant = candidates.filter(c => c.matchCount >= 1);
-    }
-    let filtered = relevant;
-    if (cp && cp > 0) {
-      filtered = relevant.filter(c => c.price >= cp * 0.6 && c.price <= cp * 1.7);
-      if (filtered.length < 2) {
-        filtered = relevant.filter(c => c.price >= cp * 0.4 && c.price <= cp * 2.5);
-      }
-      if (filtered.length < 1) {
-        filtered = candidates.filter(c => c.matchCount >= 3 && c.price >= cp * 0.3 && c.price <= cp * 4.0);
-      }
-    }
-    if (!filtered.length) return [];
 
-    const scored = filtered.map(c => {
-      let score = c.matchCount * 10;
+    // ⭐ الترتيب حسب الجودة:
+    // 1. مطابقة الموديل أولاً
+    // 2. عدد الكلمات المطابقة
+    // 3. قرب السعر
+    // 4. التقييم والمبيعات
+    const scored = candidates.map(c => {
+      let score = 0;
+      score += c.modelMatches * 40;         // موديل مطابق = مكافأة كبيرة
+      score += c.matchCount * 15;           // كل كلمة مطابقة
       if (cp && cp > 0) {
-        const ratio = c.price / cp;
-        if (ratio >= 0.7 && ratio <= 1.3) score += 20;
-        else if (ratio >= 0.5 && ratio <= 1.7) score += 10;
+        const ratio = c.priceRatio;
+        if (ratio >= 0.85 && ratio <= 1.15) score += 30;   // سعر قريب جداً
+        else if (ratio >= 0.7 && ratio <= 1.4) score += 15;
       }
       if (c.rating >= 4.5) score += 5;
       if (c.sold > 100) score += 3;
       if (c.discount > 20) score += 2;
       return { ...c, _score: score };
     });
+
     scored.sort((a, b) => (b._score !== a._score ? b._score - a._score : a.price - b.price));
-    const threshold = Math.max(3, Math.max(...scored.map(s => s._score)) * 0.3);
-    return scored.filter(s => s._score >= threshold).slice(0, 15);
+    return scored.slice(0, 50);  // احتفظ بما يصل إلى 50 بائع
   }
 
   // ═══════════════════════════════════════════════════════
@@ -714,12 +663,14 @@
         link: p.promotion_link || p.product_detail_url || "",
         title: p.product_title || "",
         matchCount: 0,
+        modelMatches: 0,
+        priceRatio: 1
       };
     }).filter(s => s.price > 0 && s.img);
   }
 
   // ═══════════════════════════════════════════════════════
-  // BUILD
+  // BUILD SELLER LIST
   // ═══════════════════════════════════════════════════════
 
   async function buildSellerList(product, forceRescan = false) {
@@ -730,12 +681,17 @@
       }
     }
     const currentKeywords = keywords(product.title);
+    const currentModels = extractModelNumbers(product.title);
     const cp = product?.price;
+
+    console.log(`[Smart Shopper] Keywords:`, currentKeywords.slice(0, 8));
+    console.log(`[Smart Shopper] Models:`, currentModels);
+    console.log(`[Smart Shopper] Current price:`, cp);
 
     await waitForStablePage(6000);
     await autoScroll();
 
-    const candidates = collectCandidates(currentKeywords);
+    const candidates = collectCandidates(currentKeywords, currentModels, cp);
     const best = pickBest(candidates, cp);
 
     if (best.length >= 1) {
@@ -743,19 +699,16 @@
       return { source: "page", sellers: best };
     }
 
+    // API fallback
     const englishWords = (product.title || "").replace(/[^\x00-\x7F\s]/g, "").split(/\s+/).filter(w => w.length > 3);
     if (englishWords.length >= 2) {
       try {
-        for (const kw of [englishWords.slice(0, 3).join(" "), englishWords.slice(0, 2).join(" ")]) {
-          const items = await apiSearch(kw);
-          if (items.length > 0) {
-            const filtered = cp ? items.filter(it => it.price >= cp * 0.5 && it.price <= cp * 2.0) : items;
-            const finalList = filtered.length >= 1 ? filtered : items;
-            const scored = finalList.map(it => ({ ...it, matchCount: countMatches(it.title || it.store, currentKeywords) }));
-            const sorted = scored.sort((a, b) => b.matchCount - a.matchCount);
-            saveCache(product, sorted, "api");
-            return { source: "api", sellers: sorted };
-          }
+        const items = await apiSearch(englishWords.slice(0, 3).join(" "));
+        if (items.length > 0) {
+          const filtered = cp ? items.filter(it => it.price >= cp * 0.7 && it.price <= cp * 1.5) : items;
+          const finalList = filtered.length >= 1 ? filtered : items;
+          saveCache(product, finalList, "api");
+          return { source: "api", sellers: finalList };
         }
       } catch (e) { console.warn(e); }
     }
@@ -844,7 +797,6 @@
       updateSourceLabel();
       renderList();
 
-      // ⭐ إرسال المنتجات المشابهة إلى Neon
       if (sellers.length > 0) {
         sendSimilarToDB(currentProduct.url, sellers);
       }
@@ -860,7 +812,7 @@
   function updateSourceLabel() {
     const el = document.getElementById("ss-source");
     if (!el) return;
-    const map = { page: T("sameProduct"), api: T("similarApi"), none: T("noAlt") };
+    const map = { page: "بائعون آخرون (من الصفحة)", api: "بائعون آخرون (API)", none: T("noAlt") };
     el.textContent = map[dataSource] || T("scanning");
   }
 
@@ -919,8 +871,6 @@
     const items = sortSellers(sellers, activeFilter);
     const cp = currentProduct?.price || 0;
     const minPrice = Math.min(...items.map(s => s.price));
-    const maxSold = Math.max(...items.map(s => s.sold || 0));
-    const maxDiscount = Math.max(...items.map(s => s.discount || 0));
 
     list.innerHTML = items.slice(0, 10).map((s, i) => {
       const rank = i + 1;
@@ -1025,7 +975,8 @@
     const soldScore = Math.min((s.sold || 0) / 5000, 1);
     const discountScore = Math.min((s.discount || 0) / 60, 1);
     const matchScore = Math.min((s.matchCount || 0) / 5, 1);
-    return priceScore * 0.25 + soldScore * 0.15 + discountScore * 0.2 + matchScore * 0.4;
+    const modelScore = Math.min((s.modelMatches || 0) / 3, 1);
+    return priceScore * 0.2 + soldScore * 0.1 + discountScore * 0.15 + matchScore * 0.25 + modelScore * 0.3;
   }
 
   function sortSellers(arr, f) {
@@ -1050,9 +1001,7 @@
     console.log("[Smart Shopper] Product:", currentProduct);
     if (!currentProduct.title || currentProduct.title.length < 5) return;
 
-    // ⭐ إرسال المنتج الرئيسي إلى Neon
     sendProductToDB(currentProduct);
-
     buildPanel();
     await doScan(false);
   }
@@ -1065,7 +1014,6 @@
     }
   });
 
-  // ⭐ إعادة الإرسال عند التنقل بين المنتجات (SPA)
   let lastUrl = location.href;
   new MutationObserver(() => {
     const url = location.href;
@@ -1082,5 +1030,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v24 ready.`);
+  console.log(`[Smart Shopper] v25 ready.`);
 })();
