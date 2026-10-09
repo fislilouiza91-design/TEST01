@@ -3,6 +3,7 @@
    Focus: Find OTHER SELLERS of the SAME product.
    Strict matching: high title overlap + model numbers + price range.
    Full i18n support via T() translation function.
+   + Guard: only runs on product pages (/item/ or /i/).
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -991,9 +992,17 @@
 
   async function run() {
     await sleep(1500);
+
+    // ⭐ الحماية الإضافية: تجاهل الصفحات التي ليست صفحات منتج
+    if (!location.href.includes("/item/") && !location.href.includes("/i/")) {
+      console.log("[Smart Shopper] ليس صفحة منتج، تم التخطي.");
+      return;
+    }
+
     currentProduct = extractProduct();
     console.log("[Smart Shopper] Product:", currentProduct);
     if (!currentProduct.title || currentProduct.title.length < 5) return;
+    if (!currentProduct.price || currentProduct.price <= 0) return;
 
     sendProductToDB(currentProduct);
     buildPanel();
@@ -1013,9 +1022,12 @@
     const url = location.href;
     if (url !== lastUrl) {
       lastUrl = url;
+      // ⭐ نفس الحماية عند التنقل
+      if (!url.includes("/item/") && !url.includes("/i/")) return;
+
       setTimeout(() => {
         const product = extractProduct();
-        if (product.title && product.title.length > 5) {
+        if (product.title && product.title.length > 5 && product.price > 0) {
           currentProduct = product;
           sendProductToDB(product);
         }
