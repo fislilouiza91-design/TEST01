@@ -1,7 +1,8 @@
 /* ═══════════════════════════════════════════════════════
    Smart Shopper — Content Script (v25)
    Focus: Find OTHER SELLERS of the SAME product.
-   Stricter matching: high title overlap + model numbers + price range.
+   Strict matching: high title overlap + model numbers + price range.
+   Full i18n support via T() translation function.
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -63,8 +64,8 @@
         discount: null
       })
     })
-    .then(() => console.log("✅ [Smart Shopper] تم إرسال المنتج الرئيسي إلى Neon."))
-    .catch(err => console.error("❌ فشل الإرسال:", err));
+    .then(() => console.log("✅ [Smart Shopper] Main product sent to Neon."))
+    .catch(err => console.error("❌ [Smart Shopper] Failed to send main product:", err));
   }
 
   function sendSimilarToDB(parentUrl, similarList) {
@@ -92,8 +93,8 @@
       headers: { "Content-Type": "text/plain" },
       body: JSON.stringify({ parent_url: parentUrl, items: payload })
     })
-    .then(() => console.log(`✅ [Smart Shopper] تم إرسال ${payload.length} بائع إلى Neon.`))
-    .catch(err => console.error("❌ فشل الإرسال:", err));
+    .then(() => console.log(`✅ [Smart Shopper] ${payload.length} sellers sent to Neon.`))
+    .catch(err => console.error("❌ [Smart Shopper] Failed to send sellers:", err));
   }
 
   // ═══════════════════════════════════════════════════════
@@ -151,6 +152,8 @@
       /¥\s*([\d]+\.?\d{0,2})/g,
       /₽\s*([\d]+\.?\d{0,2})/g,
       /₺\s*([\d]+\.?\d{0,2})/g,
+      /₹\s*([\d]+\.?\d{0,2})/g,
+      /₩\s*([\d]+\.?\d{0,2})/g,
     ];
 
     for (const re of patterns) {
@@ -176,18 +179,17 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ MODEL NUMBER EXTRACTION (جديد)
+  // MODEL NUMBER EXTRACTION
   // ═══════════════════════════════════════════════════════
 
   function extractModelNumbers(text) {
     if (!text) return [];
     const models = new Set();
-    // أنماط مثل: E88, A7, XR-15, BK2000, iPhone 15, S23 Ultra
     const patterns = [
-      /\b([A-Z]{1,3}[\s-]?\d{2,5}[A-Z]?)\b/g,      // E88, XR15, BK-2000
-      /\b([A-Z]\d{3,5})\b/g,                        // A1234
-      /\b(Pro|Plus|Max|Ultra|Lite|Mini|SE)\b/gi,    // Pro, Max, Ultra
-      /\b(\d{1,3}\s*(?:GB|TB|ml|L|W|V|mAh))\b/gi,   // 256GB, 500ml, 20W
+      /\b([A-Z]{1,3}[\s-]?\d{2,5}[A-Z]?)\b/g,
+      /\b([A-Z]\d{3,5})\b/g,
+      /\b(Pro|Plus|Max|Ultra|Lite|Mini|SE)\b/gi,
+      /\b(\d{1,3}\s*(?:GB|TB|ml|L|W|V|mAh))\b/gi,
     ];
     for (const re of patterns) {
       let m;
@@ -424,6 +426,8 @@
     "for","with","and","the","a","an","of","to","in","on","at","by","is","original","new","hot","sale","free","shipping","best","top","quality","high","wholesale","dropshipping","factory","brand","genuine","fast","delivery","1pc","2pcs","3pcs","pcs","set","pack","style","type","you","your","this","that","from","into","only","more","all","any","good","great","item","product","pieces","piece",
     "من","في","على","إلى","مع","عن","هذا","هذه","ذلك","التي","الذي","أو","و","ثم","لكن","حتى","بعد","قبل","كل","بعض","أي","لا","ما","هو","هي","كان","يكون","جدا","أكثر","أقل","جديد","جديدة","الأصلي","الأصلية","الآن","اليوم","سعر","أسعار","شحن","مجاني","مجانا","بيع","شراء","منتج","منتجات","عالية","جودة","أفضل","أحسن","رخيص","حديث","حديثة","متطور","متطورة","قابل","قابلة",
     "pour","avec","et","le","la","les","un","une","des","de","du","au","ce","cette","ces","son","sa","ses","dans","sur","par","vers","est","sont","être","avoir","très","plus","moins","tout","tous","nouveau","nouvelle","original","meilleur","haute","qualité","livraison","gratuit","vente","produit","produits","prix",
+    "para","con","y","el","la","los","las","un","una","de","del","al","este","esta","en","por","es","son","ser","estar","muy","más","menos","todo","todos","nuevo","nueva","mejor","alta","calidad","envío","gratis","venta","producto","productos",
+    "für","mit","und","der","die","das","den","dem","des","ein","eine","einem","eines","dieser","diese","dieses","auf","zu","nach","ist","sind","sein","haben","sehr","mehr","weniger","alle","neu","neue","original","beste","bester","hohe","qualität","versand","kostenlos","verkauf","produkt","produkte",
   ]);
 
   function keywords(text) {
@@ -546,7 +550,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ MAIN SCRAPER — strict matching for same product
+  // MAIN SCRAPER — strict matching for same product
   // ═══════════════════════════════════════════════════════
 
   function collectCandidates(currentKeywords, currentModels, cp) {
@@ -569,17 +573,13 @@
         const title = extractTitleFromCard(card);
         if (!title || title.length < 8) continue;
 
-        // ⭐ حسابات المطابقة
         const matchCount = countMatches(title, currentKeywords);
         const modelMatches = modelMatchCount(title, currentModels);
         const priceRatio = cp ? priceInfo.price / cp : 1;
 
-        // ⭐ فلترة صارمة: يجب أن يطابق 3 كلمات على الأقل
-        //   أو يطابق 2 كلمات + موديل
         const isStrictMatch = matchCount >= 3 || (matchCount >= 2 && modelMatches >= 1);
         if (!isStrictMatch) continue;
 
-        // ⭐ فلترة السعر: يجب أن يكون ضمن 50%-200%
         if (cp && (priceRatio < 0.5 || priceRatio > 2.0)) continue;
 
         const sold = extractSoldFromCard(card);
@@ -605,24 +605,19 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ PICK BEST SELLERS (strict)
+  // PICK BEST SELLERS (strict)
   // ═══════════════════════════════════════════════════════
 
   function pickBest(candidates, cp) {
     if (!candidates.length) return [];
 
-    // ⭐ الترتيب حسب الجودة:
-    // 1. مطابقة الموديل أولاً
-    // 2. عدد الكلمات المطابقة
-    // 3. قرب السعر
-    // 4. التقييم والمبيعات
     const scored = candidates.map(c => {
       let score = 0;
-      score += c.modelMatches * 40;         // موديل مطابق = مكافأة كبيرة
-      score += c.matchCount * 15;           // كل كلمة مطابقة
+      score += c.modelMatches * 40;
+      score += c.matchCount * 15;
       if (cp && cp > 0) {
         const ratio = c.priceRatio;
-        if (ratio >= 0.85 && ratio <= 1.15) score += 30;   // سعر قريب جداً
+        if (ratio >= 0.85 && ratio <= 1.15) score += 30;
         else if (ratio >= 0.7 && ratio <= 1.4) score += 15;
       }
       if (c.rating >= 4.5) score += 5;
@@ -632,7 +627,7 @@
     });
 
     scored.sort((a, b) => (b._score !== a._score ? b._score - a._score : a.price - b.price));
-    return scored.slice(0, 50);  // احتفظ بما يصل إلى 50 بائع
+    return scored.slice(0, 50);
   }
 
   // ═══════════════════════════════════════════════════════
@@ -699,7 +694,6 @@
       return { source: "page", sellers: best };
     }
 
-    // API fallback
     const englishWords = (product.title || "").replace(/[^\x00-\x7F\s]/g, "").split(/\s+/).filter(w => w.length > 3);
     if (englishWords.length >= 2) {
       try {
@@ -812,7 +806,7 @@
   function updateSourceLabel() {
     const el = document.getElementById("ss-source");
     if (!el) return;
-    const map = { page: "بائعون آخرون (من الصفحة)", api: "بائعون آخرون (API)", none: T("noAlt") };
+    const map = { page: T("sameProduct"), api: T("similarApi"), none: T("noAlt") };
     el.textContent = map[dataSource] || T("scanning");
   }
 
