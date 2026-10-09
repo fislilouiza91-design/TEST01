@@ -1,8 +1,7 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v31)
-   - Cache-first
-   - Real prices fetched from server (zero client data)
-   - Strict matching
+   Smart Shopper — Content Script (v32)
+   + Hide old price unless it's a real discount (5%+)
+   + Cache-first, real prices from server, strict matching
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -15,7 +14,7 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v31 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v32 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
@@ -37,7 +36,7 @@
   let lastSentSimilar = "";
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ REAL PRICE CACHE (7 days)
+  // REAL PRICE CACHE (7 days)
   // ═══════════════════════════════════════════════════════
 
   const REAL_PRICE_CACHE_KEY = "ss-real-prices";
@@ -67,7 +66,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ FETCH REAL PRICES FROM SERVER (zero client cost)
+  // FETCH REAL PRICES FROM SERVER (zero client cost)
   // ═══════════════════════════════════════════════════════
 
   async function fetchRealPricesBatch(sellersList) {
@@ -710,7 +709,8 @@
         if (valid.length > 1 && current / valid[0] > 1.15) old = current;
       }
     }
-    if (old > 0 && old <= current) old = 0;
+    // ⭐ السعر المشطوب يجب أن يكون أعلى بـ 5% على الأقل
+    if (old > 0 && old <= current * 1.05) old = 0;
     if (discount < 0 || discount > 90) discount = 0;
     if (!discount && old > current && current > 0) discount = Math.round((1 - current / old) * 100);
     return { price: current, oldPrice: old, discount };
@@ -1130,7 +1130,11 @@
       else if (isCheap && cp) tag = `<span class="ss-tag ss-cheap">${T("bestPrice")}</span>`;
 
       const discountBadge = s.discount > 0 ? `<span class="ss-discount">-${s.discount}%</span>` : "";
-      const oldPriceHtml = s.oldPrice > 0 ? `<span class="ss-old-price">${formatPrice(s.oldPrice, currentProduct?.currency)}</span>` : "";
+
+      // ⭐ لا تعرض السعر المشطوب إلا إذا كان فرق حقيقي (5%+)
+      const showOldPrice = s.oldPrice > 0 && s.oldPrice > s.price * 1.05;
+      const oldPriceHtml = showOldPrice ? `<span class="ss-old-price">${formatPrice(s.oldPrice, currentProduct?.currency)}</span>` : "";
+
       const ratingHtml = s.rating > 0 ? `<span class="ss-rating">★ ${s.rating.toFixed(1)}</span>` : "";
       const soldHtml = s.sold > 0 ? `<span class="ss-sold">${fmt(s.sold)} ${T("sold")}</span>` : "";
       const metaItems = [ratingHtml, soldHtml].filter(Boolean).join('<span class="ss-sep">·</span>');
@@ -1294,5 +1298,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v31 ready.`);
+  console.log(`[Smart Shopper] v32 ready.`);
 })();
