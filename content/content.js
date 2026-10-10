@@ -1,6 +1,6 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v36)
-   + Shipping price extraction (Free or actual amount)
+   Smart Shopper — Content Script (v37)
+   + Fetch real shipping via productdetail.get for API results
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -13,7 +13,7 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v36 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v37 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
@@ -21,6 +21,7 @@
   const DB_SIMILAR_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/similar";
   const AFFILIATE_LINK_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/api/link";
   const REAL_PRICES_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/real-prices-batch";
+  const PRODUCT_DETAILS_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/api/product";
   const CACHE_TTL = 1000 * 60 * 30;
   const DB_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
   const REAL_PRICE_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
@@ -35,7 +36,7 @@
   let lastSentSimilar = "";
 
   // ═══════════════════════════════════════════════════════
-  // REAL PRICE CACHE (7 days)
+  // REAL PRICE CACHE
   // ═══════════════════════════════════════════════════════
 
   const REAL_PRICE_CACHE_KEY = "ss-real-prices";
@@ -65,7 +66,79 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ SHIPPING PRICE EXTRACTION
+  // ⭐ ENRICH API RESULTS WITH SHIPPING (from productdetail.get)
+  // ═══════════════════════════════════════════════════════
+
+  async function enrichWithShipping(sellersList) {
+    if (!sellersList || sellersList.length === 0) return;
+
+    // نأخذ 5 نتائج فقط لتقليل استهلاك API
+    const top = sellersList.slice(0, 5);
+
+    const ids = top
+      .map(s => extractProductId(s.link))
+      .filter(id => id);
+
+    if (ids.length === 0) {
+      console.log("[Smart Shopper] لا توجد معرّفات منتجات لجلب الشحن.");
+      return;
+    }
+
+    try {
+      console.log(`[Smart Shopper] 🚚 طلب تفاصيل الشحن لـ ${ids.length} منتج...`);
+
+      const res = await fetch(PRODUCT_DETAILS_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ productIds: ids, currency: "USD", country: "US" })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "API error");
+
+      const products = data.data?.aliexpress_affiliate_productdetail_get_response
+        ?.resp_result?.result?.products?.product || [];
+
+      // بناء خريطة: product_id → shipping info
+      const shippingMap = {};
+      for (const p of products) {
+        const pid = String(p.product_id || "");
+        if (!pid) continue;
+
+        let shippingPrice = null;
+        if (p.freight_amount !== undefined && p.freight_amount !== null) {
+          const amt = parseFloat(p.freight_amount);
+          if (!isNaN(amt) && amt >= 0 && amt < 500) shippingPrice = amt;
+        }
+        if (p.free_shipping === "true" || p.free_shipping === true) shippingPrice = 0;
+
+        shippingMap[pid] = shippingPrice;
+      }
+
+      // حدّث sellers
+      let updated = 0;
+      for (const s of top) {
+        const pid = extractProductId(s.link);
+        if (pid && shippingMap[pid] !== undefined) {
+          s.shippingPrice = shippingMap[pid];
+          s.isFreeShipping = shippingMap[pid] === 0 ? true : (shippingMap[pid] === null ? null : false);
+          updated++;
+        }
+      }
+
+      if (updated > 0) {
+        console.log(`✅ [Smart Shopper] تم تحديث الشحن لـ ${updated} منتج.`);
+        renderList();
+      } else {
+        console.log("[Smart Shopper] لم يتم استخراج معلومات الشحن من API.");
+      }
+    } catch (e) {
+      console.warn("[Smart Shopper] فشل طلب الشحن:", e);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // SHIPPING PRICE EXTRACTION (from card)
   // ═══════════════════════════════════════════════════════
 
   function extractShippingFromCard(card) {
@@ -73,7 +146,6 @@
       const txt = card.innerText || "";
       const lower = txt.toLowerCase();
 
-      // ─── 1. الشحن المجاني ───
       const freePatterns = [
         /free\s+shipping/i,
         /free\s+delivery/i,
@@ -92,7 +164,6 @@
         }
       }
 
-      // ─── 2. سعر الشحن مع رمز العملة ───
       const currencyPatterns = [
         /(?:shipping|delivery|freight)\s*:?\s*(?:US\s*)?\$\s*([\d.,]+)/i,
         /\$\s*([\d.,]+)\s*(?:shipping|delivery|freight)/i,
@@ -111,7 +182,6 @@
         }
       }
 
-      // ─── 3. لا معلومات ───
       return { shippingPrice: null, isFreeShipping: null };
     } catch (_) {
       return { shippingPrice: null, isFreeShipping: null };
@@ -119,7 +189,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // FETCH REAL PRICES FROM SERVER (internal use)
+  // FETCH REAL PRICES FROM SERVER
   // ═══════════════════════════════════════════════════════
 
   async function fetchRealPricesBatch(sellersList) {
@@ -219,7 +289,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // SEND SIMILAR PRODUCTS (RAW URLs only)
+  // SEND SIMILAR PRODUCTS
   // ═══════════════════════════════════════════════════════
 
   function sendSimilarToDB(parentUrl, similarList) {
@@ -263,7 +333,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // GENERATE FRESH AFFILIATE LINKS
+  // AFFILIATE LINKS
   // ═══════════════════════════════════════════════════════
 
   async function generateAffiliateLinks(sellersInput) {
@@ -924,14 +994,6 @@
       const discount = oldP > price && price > 0 ? Math.round((1 - price / oldP) * 100) : 0;
       const rating = parseFloat(String(p.evaluate_rate || "0").replace("%", "")) / 20;
 
-      // ⭐ استخراج سعر الشحن من API
-      let shippingPrice = null;
-      if (p.freight_amount !== undefined && p.freight_amount !== null) {
-        const amt = parseFloat(p.freight_amount);
-        if (!isNaN(amt) && amt >= 0 && amt < 500) shippingPrice = amt;
-      }
-      if (p.free_shipping === "true" || p.free_shipping === true) shippingPrice = 0;
-
       return {
         store: p.shop_name || "AliExpress Seller",
         img: p.product_main_image_url || "",
@@ -941,8 +1003,8 @@
         link: p.product_detail_url || p.promotion_link || "",
         title: p.product_title || "",
         matchCount: 0, modelMatches: 0, brandMatches: 0, specRatio: 0, priceRatio: 1,
-        shippingPrice: shippingPrice,
-        isFreeShipping: shippingPrice === 0 ? true : (shippingPrice === null ? null : false)
+        shippingPrice: null,
+        isFreeShipping: null
       };
     }).filter(s => s.price > 0 && s.img);
   }
@@ -999,6 +1061,12 @@
         if (strict.length >= 1) {
           const enriched = strict.map(it => ({ ...it, matchCount: countMatches(it.title || it.store, currentKeywords) }));
           saveCache(product, enriched, "api");
+
+          // ⭐ اجلب الشحن في الخلفية (لا ينتظر المستخدم)
+          enrichWithShipping(enriched).then(() => {
+            try { saveCache(product, enriched, "api"); } catch (_) {}
+          }).catch(() => {});
+
           return { source: "api", sellers: enriched };
         }
       } catch (e) { console.warn(e); }
@@ -1201,7 +1269,6 @@
       const saveStr = pricePercent > 0 ? `−${pricePercent}%` : (pricePercent < 0 ? `+${Math.abs(pricePercent)}%` : "");
       const realBadge = s._realPrice ? `<span class="ss-real-price" title="سعر حقيقي">✓</span>` : "";
 
-      // ⭐ سطر الشحن أسفل السعر
       let shippingLineHtml = "";
       if (s.shippingPrice === 0) {
         shippingLineHtml = `<div class="ss-ship-free">🚚 Free shipping</div>`;
@@ -1368,5 +1435,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v36 ready.`);
+  console.log(`[Smart Shopper] v37 ready.`);
 })();
