@@ -1,6 +1,6 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v35)
-   + Shipping indicator (Free / Paid)
+   Smart Shopper — Content Script (v36)
+   + Shipping price extraction (Free or actual amount)
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -13,7 +13,7 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v35 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v36 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
@@ -65,14 +65,15 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ SHIPPING DETECTION
+  // ⭐ SHIPPING PRICE EXTRACTION
   // ═══════════════════════════════════════════════════════
 
   function extractShippingFromCard(card) {
     try {
-      const txt = (card.innerText || "").toLowerCase();
+      const txt = card.innerText || "";
+      const lower = txt.toLowerCase();
 
-      // ─── 1. كشف الشحن المجاني ───
+      // ─── 1. الشحن المجاني ───
       const freePatterns = [
         /free\s+shipping/i,
         /free\s+delivery/i,
@@ -86,33 +87,34 @@
         /무료\s*배송/,
       ];
       for (const re of freePatterns) {
-        if (re.test(txt)) return { isFreeShipping: true, shippingText: "Free" };
+        if (re.test(lower)) {
+          return { shippingPrice: 0, isFreeShipping: true };
+        }
       }
 
-      // ─── 2. كشف الشحن المدفوع ───
-      const paidPatterns = [
-        /(?:shipping|delivery|freight)\s*:?\s*\$?\s*([\d.]+)/i,
-        /\$\s*([\d.]+)\s*(?:shipping|delivery)/i,
-        /livraison\s*:?\s*([\d.,]+)/i,
+      // ─── 2. سعر الشحن مع رمز العملة ───
+      const currencyPatterns = [
+        /(?:shipping|delivery|freight)\s*:?\s*(?:US\s*)?\$\s*([\d.,]+)/i,
+        /\$\s*([\d.,]+)\s*(?:shipping|delivery|freight)/i,
+        /\+?\s*\$\s*([\d.,]+)\s*(?:shipping|ship)/i,
+        /(?:livraison|expédition)\s*:?\s*([\d.,]+)/i,
+        /(?:الشحن|شحن)\s*:?\s*([\d.,]+)/i,
       ];
-      for (const re of paidPatterns) {
+
+      for (const re of currencyPatterns) {
         const m = txt.match(re);
         if (m) {
           const amt = parseFloat(m[1].replace(",", "."));
-          if (amt > 0 && amt < 500) {
-            return { isFreeShipping: false, shippingText: "Paid" };
+          if (!isNaN(amt) && amt >= 0 && amt < 500) {
+            return { shippingPrice: amt, isFreeShipping: amt === 0 };
           }
         }
       }
 
-      // ─── 3. إذا ذكر "shipping" بدون "free" → مدفوع ───
-      if (/(shipping|delivery|livraison|envío)/i.test(txt)) {
-        return { isFreeShipping: false, shippingText: "Paid" };
-      }
-
-      return { isFreeShipping: null, shippingText: "" };
+      // ─── 3. لا معلومات ───
+      return { shippingPrice: null, isFreeShipping: null };
     } catch (_) {
-      return { isFreeShipping: null, shippingText: "" };
+      return { shippingPrice: null, isFreeShipping: null };
     }
   }
 
@@ -341,6 +343,8 @@
         sold: row.sold_count,
         link: row.product_url,
         matchCount: row.match_count,
+        shippingPrice: null,
+        isFreeShipping: null,
         _cachedAt: row.scraped_at
       }));
     } catch (e) { return null; }
@@ -868,8 +872,8 @@
           img, price: priceInfo.price, oldPrice: priceInfo.oldPrice, discount: priceInfo.discount,
           rating, sold: sold || 0, link: href, matchCount, modelMatches, brandMatches,
           specMatches: specResult.matched, specTotal: specResult.total, specRatio: specResult.ratio, priceRatio,
-          isFreeShipping: shippingInfo.isFreeShipping,
-          shippingText: shippingInfo.shippingText
+          shippingPrice: shippingInfo.shippingPrice,
+          isFreeShipping: shippingInfo.isFreeShipping
         });
       } catch (_) {}
     }
@@ -893,7 +897,7 @@
       if (c.rating >= 4.5) score += 5;
       if (c.sold > 100) score += 3;
       if (c.discount > 20) score += 2;
-      if (c.isFreeShipping === true) score += 4;   // ⭐ مكافأة للشحن المجاني
+      if (c.isFreeShipping === true) score += 4;
       return { ...c, _score: score };
     });
     scored.sort((a, b) => (b._score !== a._score ? b._score - a._score : a.price - b.price));
@@ -919,12 +923,15 @@
       const oldP = parseFloat(p.target_original_price || p.original_price || 0);
       const discount = oldP > price && price > 0 ? Math.round((1 - price / oldP) * 100) : 0;
       const rating = parseFloat(String(p.evaluate_rate || "0").replace("%", "")) / 20;
-      let isFree = null;
+
+      // ⭐ استخراج سعر الشحن من API
+      let shippingPrice = null;
       if (p.freight_amount !== undefined && p.freight_amount !== null) {
         const amt = parseFloat(p.freight_amount);
-        if (!isNaN(amt)) isFree = amt === 0;
+        if (!isNaN(amt) && amt >= 0 && amt < 500) shippingPrice = amt;
       }
-      if (p.free_shipping === "true" || p.free_shipping === true) isFree = true;
+      if (p.free_shipping === "true" || p.free_shipping === true) shippingPrice = 0;
+
       return {
         store: p.shop_name || "AliExpress Seller",
         img: p.product_main_image_url || "",
@@ -934,8 +941,8 @@
         link: p.product_detail_url || p.promotion_link || "",
         title: p.product_title || "",
         matchCount: 0, modelMatches: 0, brandMatches: 0, specRatio: 0, priceRatio: 1,
-        isFreeShipping: isFree,
-        shippingText: ""
+        shippingPrice: shippingPrice,
+        isFreeShipping: shippingPrice === 0 ? true : (shippingPrice === null ? null : false)
       };
     }).filter(s => s.price > 0 && s.img);
   }
@@ -1190,18 +1197,17 @@
       const oldPriceHtml = s.oldPrice > 0 ? `<span class="ss-old-price">${formatPrice(s.oldPrice, currentProduct?.currency)}</span>` : "";
       const ratingHtml = s.rating > 0 ? `<span class="ss-rating">★ ${s.rating.toFixed(1)}</span>` : "";
       const soldHtml = s.sold > 0 ? `<span class="ss-sold">${fmt(s.sold)} ${T("sold")}</span>` : "";
-
-      // ⭐ مؤشر الشحن
-      let shippingHtml = "";
-      if (s.isFreeShipping === true) {
-        shippingHtml = `<span class="ss-free-ship" title="Free shipping">🚚 Free</span>`;
-      } else if (s.isFreeShipping === false) {
-        shippingHtml = `<span class="ss-paid-ship" title="Paid shipping">💵 Paid</span>`;
-      }
-
-      const metaItems = [ratingHtml, soldHtml, shippingHtml].filter(Boolean).join('<span class="ss-sep">·</span>');
+      const metaItems = [ratingHtml, soldHtml].filter(Boolean).join('<span class="ss-sep">·</span>');
       const saveStr = pricePercent > 0 ? `−${pricePercent}%` : (pricePercent < 0 ? `+${Math.abs(pricePercent)}%` : "");
       const realBadge = s._realPrice ? `<span class="ss-real-price" title="سعر حقيقي">✓</span>` : "";
+
+      // ⭐ سطر الشحن أسفل السعر
+      let shippingLineHtml = "";
+      if (s.shippingPrice === 0) {
+        shippingLineHtml = `<div class="ss-ship-free">🚚 Free shipping</div>`;
+      } else if (s.shippingPrice && s.shippingPrice > 0) {
+        shippingLineHtml = `<div class="ss-ship-paid">+ ${formatPrice(s.shippingPrice, currentProduct?.currency)} shipping</div>`;
+      }
 
       return `
         <div class="ss-row ${rowClass}" data-idx="${i}">
@@ -1218,6 +1224,7 @@
               ${realBadge}
               ${discountBadge}
             </div>
+            ${shippingLineHtml}
             ${oldPriceHtml ? `<div class="ss-old-line">${oldPriceHtml}</div>` : ""}
             ${cp && saveStr ? `<div class="ss-vs">${T("vs")} ${formatPrice(cp, currentProduct?.currency)} <b>${saveStr}</b></div>` : ""}
           </div>
@@ -1361,5 +1368,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v35 ready.`);
+  console.log(`[Smart Shopper] v36 ready.`);
 })();
