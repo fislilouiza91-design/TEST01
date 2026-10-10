@@ -1,6 +1,10 @@
 /* ═══════════════════════════════════════════════════════
-   Smart Shopper — Content Script (v37)
-   + Fetch real shipping via productdetail.get for API results
+   Smart Shopper — Content Script (v40)
+   + HTML extraction for ALL sources (Page + API)
+   + 9 products in 3 batches
+   + Silent update (no badge)
+   + Save real data to Neon after fetch
+   + Load full data from Neon cache
    ═══════════════════════════════════════════════════════ */
 
 (function () {
@@ -13,18 +17,19 @@
   const LANG = typeof SS_LANG !== "undefined" ? SS_LANG : "en";
   const IS_RTL = typeof SS_RTL !== "undefined" ? SS_RTL : false;
 
-  console.log(`[Smart Shopper] v37 | Language: ${LANG}`);
+  console.log(`[Smart Shopper] v40 | Language: ${LANG}`);
 
   const PANEL_ID = "ss-floating-panel";
   const WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev";
   const DB_WORKER_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/product";
   const DB_SIMILAR_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/similar";
+  const DB_UPDATE_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/update-similar";
   const AFFILIATE_LINK_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/api/link";
   const REAL_PRICES_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/real-prices-batch";
-  const PRODUCT_DETAILS_URL = "https://smart-shopper-proxy.fislilouiza91.workers.dev/api/product";
   const CACHE_TTL = 1000 * 60 * 30;
   const DB_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
   const REAL_PRICE_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
+  const MAX_PRODUCTS_TO_FETCH = 9;
 
   let currentProduct = null;
   let sellers = [];
@@ -36,7 +41,7 @@
   let lastSentSimilar = "";
 
   // ═══════════════════════════════════════════════════════
-  // REAL PRICE CACHE
+  // REAL PRICE CACHE (localStorage)
   // ═══════════════════════════════════════════════════════
 
   const REAL_PRICE_CACHE_KEY = "ss-real-prices";
@@ -59,86 +64,153 @@
     try { localStorage.setItem(REAL_PRICE_CACHE_KEY, JSON.stringify(cache)); } catch (_) {}
   }
 
-  function setCachedRealPrice(url, price, currency) {
+  function setCachedRealPrice(url, price, currency, shippingPrice, extra) {
     const cache = loadRealPriceCache();
-    cache[url] = { price, currency, ts: Date.now() };
+    cache[url] = {
+      price,
+      currency,
+      shippingPrice: shippingPrice !== undefined ? shippingPrice : null,
+      rating: extra?.rating || null,
+      sold: extra?.sold || null,
+      seller: extra?.seller || null,
+      ts: Date.now()
+    };
     saveRealPriceCache(cache);
   }
 
   // ═══════════════════════════════════════════════════════
-  // ⭐ ENRICH API RESULTS WITH SHIPPING (from productdetail.get)
+  // FETCH REAL PRICES FROM SERVER (HTML)
   // ═══════════════════════════════════════════════════════
 
-  async function enrichWithShipping(sellersList) {
+  async function fetchRealPricesBatch(sellersList) {
     if (!sellersList || sellersList.length === 0) return;
 
-    // نأخذ 5 نتائج فقط لتقليل استهلاك API
-    const top = sellersList.slice(0, 5);
+    const cache = loadRealPriceCache();
+    let cachedCount = 0;
+    const needFetch = [];
 
-    const ids = top
-      .map(s => extractProductId(s.link))
-      .filter(id => id);
+    for (const s of sellersList) {
+      const url = s.link;
+      if (!url || !url.includes("/item/")) continue;
 
-    if (ids.length === 0) {
-      console.log("[Smart Shopper] لا توجد معرّفات منتجات لجلب الشحن.");
-      return;
+      if (cache[url] && cache[url].price > 0) {
+        s.price = cache[url].price;
+        if (cache[url].currency) s.currency = cache[url].currency;
+        if (cache[url].shippingPrice !== undefined && cache[url].shippingPrice !== null) {
+          s.shippingPrice = cache[url].shippingPrice;
+          s.isFreeShipping = cache[url].shippingPrice === 0;
+        }
+        if (cache[url].rating && cache[url].rating > 0) s.rating = cache[url].rating;
+        if (cache[url].sold && cache[url].sold > 0) s.sold = cache[url].sold;
+        if (cache[url].seller && cache[url].seller.length > 2) s.store = cache[url].seller;
+        s._realPrice = true;
+        cachedCount++;
+      } else {
+        needFetch.push(s);
+      }
     }
 
-    try {
-      console.log(`[Smart Shopper] 🚚 طلب تفاصيل الشحن لـ ${ids.length} منتج...`);
+    if (cachedCount > 0) {
+      console.log(`[Smart Shopper] ✅ ${cachedCount} من Cache.`);
+      renderList();
+    }
+    if (needFetch.length === 0) return;
 
-      const res = await fetch(PRODUCT_DETAILS_URL, {
+    const toFetch = needFetch.slice(0, MAX_PRODUCTS_TO_FETCH);
+    const urls = toFetch.map(s => s.link);
+
+    console.log(`[Smart Shopper] 🌐 طلب ${urls.length} (سعر + شحن) من السيرفر...`);
+
+    try {
+      const res = await fetch(REAL_PRICES_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ productIds: ids, currency: "USD", country: "US" })
+        body: JSON.stringify({ urls })
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (!data.ok) throw new Error(data.error || "API error");
 
-      const products = data.data?.aliexpress_affiliate_productdetail_get_response
-        ?.resp_result?.result?.products?.product || [];
-
-      // بناء خريطة: product_id → shipping info
-      const shippingMap = {};
-      for (const p of products) {
-        const pid = String(p.product_id || "");
-        if (!pid) continue;
-
-        let shippingPrice = null;
-        if (p.freight_amount !== undefined && p.freight_amount !== null) {
-          const amt = parseFloat(p.freight_amount);
-          if (!isNaN(amt) && amt >= 0 && amt < 500) shippingPrice = amt;
-        }
-        if (p.free_shipping === "true" || p.free_shipping === true) shippingPrice = 0;
-
-        shippingMap[pid] = shippingPrice;
-      }
-
-      // حدّث sellers
       let updated = 0;
-      for (const s of top) {
-        const pid = extractProductId(s.link);
-        if (pid && shippingMap[pid] !== undefined) {
-          s.shippingPrice = shippingMap[pid];
-          s.isFreeShipping = shippingMap[pid] === 0 ? true : (shippingMap[pid] === null ? null : false);
+      for (const s of toFetch) {
+        const found = data.results[s.link];
+        if (found && found.success && found.price > 0) {
+          s.price = found.price;
+          if (found.currency) s.currency = found.currency;
+          s._realPrice = true;
+          if (found.shippingPrice !== undefined && found.shippingPrice !== null) {
+            s.shippingPrice = found.shippingPrice;
+            s.isFreeShipping = found.shippingPrice === 0;
+          }
+          if (found.rating && found.rating > 0) s.rating = found.rating;
+          if (found.sold && found.sold > 0) s.sold = found.sold;
+          if (found.seller && found.seller.length > 2) s.store = found.seller;
+          if (found.title && found.title.length > 5) s.title = found.title;
+          if (found.image && found.image.startsWith("http")) s.img = found.image;
+
+          setCachedRealPrice(s.link, found.price, found.currency, found.shippingPrice, {
+            rating: found.rating,
+            sold: found.sold,
+            seller: found.seller
+          });
           updated++;
         }
       }
 
       if (updated > 0) {
-        console.log(`✅ [Smart Shopper] تم تحديث الشحن لـ ${updated} منتج.`);
+        console.log(`✅ [Smart Shopper] تم تحديث ${updated} منتج.`);
         renderList();
-      } else {
-        console.log("[Smart Shopper] لم يتم استخراج معلومات الشحن من API.");
+
+        // ⭐ احفظ البيانات الدقيقة في Neon
+        updateDBWithRealData(toFetch, currentProduct.url).catch(() => {});
       }
     } catch (e) {
-      console.warn("[Smart Shopper] فشل طلب الشحن:", e);
+      console.warn("[Smart Shopper] فشل قراءة الأسعار:", e);
     }
   }
 
   // ═══════════════════════════════════════════════════════
-  // SHIPPING PRICE EXTRACTION (from card)
+  // ⭐ UPDATE DB WITH REAL DATA
+  // ═══════════════════════════════════════════════════════
+
+  async function updateDBWithRealData(sellersList, parentUrl) {
+    if (!sellersList || sellersList.length === 0 || !parentUrl) return;
+
+    const payload = sellersList
+      .filter(s => s.link && s.price > 0)
+      .map(s => ({
+        parent_url: parentUrl,
+        product_url: normalizeToRawUrl(s.link),
+        price: s.price || 0,
+        old_price: s.oldPrice || 0,
+        discount: s.discount || 0,
+        rating: s.rating || 0,
+        sold_count: s.sold || 0,
+        image_url: s.img || "",
+        currency: s.currency || "USD",
+        shipping_price: s.shippingPrice !== undefined ? s.shippingPrice : null,
+        is_free_shipping: s.isFreeShipping !== undefined ? s.isFreeShipping : null
+      }));
+
+    if (payload.length === 0) return;
+
+    try {
+      const res = await fetch(DB_UPDATE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: payload })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        console.log(`✅ [Smart Shopper] تم حفظ ${data.updated} منتج في Neon.`);
+      }
+    } catch (e) {
+      console.warn("[Smart Shopper] فشل حفظ البيانات في Neon:", e);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // SHIPPING FROM CARD
   // ═══════════════════════════════════════════════════════
 
   function extractShippingFromCard(card) {
@@ -147,21 +219,13 @@
       const lower = txt.toLowerCase();
 
       const freePatterns = [
-        /free\s+shipping/i,
-        /free\s+delivery/i,
-        /livraison\s+gratuite/i,
-        /env[íi]o\s+gratis/i,
-        /kostenloser\s+versand/i,
-        /الشحن\s+مجاني/,
-        /شحن\s+مجاني/,
-        /免費送貨/,
-        /送料無料/,
-        /무료\s*배송/,
+        /free\s+shipping/i, /free\s+delivery/i,
+        /livraison\s+gratuite/i, /env[íi]o\s+gratis/i,
+        /kostenloser\s+versand/i, /الشحن\s+مجاني/, /شحن\s+مجاني/,
+        /免費送貨/, /送料無料/, /무료\s*배송/,
       ];
       for (const re of freePatterns) {
-        if (re.test(lower)) {
-          return { shippingPrice: 0, isFreeShipping: true };
-        }
+        if (re.test(lower)) return { shippingPrice: 0, isFreeShipping: true };
       }
 
       const currencyPatterns = [
@@ -185,71 +249,6 @@
       return { shippingPrice: null, isFreeShipping: null };
     } catch (_) {
       return { shippingPrice: null, isFreeShipping: null };
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════
-  // FETCH REAL PRICES FROM SERVER
-  // ═══════════════════════════════════════════════════════
-
-  async function fetchRealPricesBatch(sellersList) {
-    if (!sellersList || sellersList.length === 0) return;
-
-    const cache = loadRealPriceCache();
-    let cachedCount = 0;
-    const needFetch = [];
-
-    for (const s of sellersList) {
-      const url = s.link;
-      if (!url || !url.includes("/item/")) continue;
-
-      if (cache[url] && cache[url].price > 0) {
-        s.price = cache[url].price;
-        if (cache[url].currency) s.currency = cache[url].currency;
-        s._realPrice = true;
-        cachedCount++;
-      } else {
-        needFetch.push(s);
-      }
-    }
-
-    if (cachedCount > 0) {
-      console.log(`[Smart Shopper] ✅ ${cachedCount} سعر من Cache.`);
-      renderList();
-    }
-    if (needFetch.length === 0) return;
-
-    const urls = needFetch.slice(0, 8).map(s => s.link);
-    console.log(`[Smart Shopper] 🌐 طلب ${urls.length} سعر من السيرفر...`);
-
-    try {
-      const res = await fetch(REAL_PRICES_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ urls })
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || "API error");
-
-      let updated = 0;
-      for (const s of needFetch) {
-        const found = data.results[s.link];
-        if (found && found.success && found.price > 0) {
-          s.price = found.price;
-          if (found.currency) s.currency = found.currency;
-          s._realPrice = true;
-          setCachedRealPrice(s.link, found.price, found.currency);
-          updated++;
-        }
-      }
-
-      if (updated > 0) {
-        console.log(`✅ [Smart Shopper] تم تحديث ${updated} سعر حقيقي من السيرفر.`);
-        renderList();
-      }
-    } catch (e) {
-      console.warn("[Smart Shopper] فشل قراءة الأسعار:", e);
     }
   }
 
@@ -289,7 +288,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  // SEND SIMILAR PRODUCTS
+  // SEND SIMILAR PRODUCTS TO NEON
   // ═══════════════════════════════════════════════════════
 
   function sendSimilarToDB(parentUrl, similarList) {
@@ -308,7 +307,10 @@
         rating: s.rating || 0,
         sold_count: s.sold || 0,
         image_url: s.img || "",
-        match_count: s.matchCount || 0
+        match_count: s.matchCount || 0,
+        currency: s.currency || "USD",
+        shipping_price: s.shippingPrice !== undefined ? s.shippingPrice : null,
+        is_free_shipping: s.isFreeShipping !== undefined ? s.isFreeShipping : null
       })).filter(item => item.product_url);
 
       if (payload.length === 0) return;
@@ -408,14 +410,15 @@
         img: row.image_url,
         price: parseFloat(row.price),
         oldPrice: parseFloat(row.old_price),
-        discount: row.discount,
+        discount: row.discount || 0,
         rating: parseFloat(row.rating),
         sold: row.sold_count,
         link: row.product_url,
         matchCount: row.match_count,
-        shippingPrice: null,
-        isFreeShipping: null,
-        _cachedAt: row.scraped_at
+        currency: row.currency || "USD",
+        shippingPrice: (row.shipping_price !== null && row.shipping_price !== undefined) ? parseFloat(row.shipping_price) : null,
+        isFreeShipping: (row.is_free_shipping !== null && row.is_free_shipping !== undefined) ? row.is_free_shipping : null,
+        _cachedAt: row.updated_at || row.scraped_at
       }));
     } catch (e) { return null; }
   }
@@ -609,10 +612,6 @@
     return { price: null, currency: "USD" };
   }
 
-  // ═══════════════════════════════════════════════════════
-  // TITLE / IMAGE / SOLD / RATING
-  // ═══════════════════════════════════════════════════════
-
   function getTitle() {
     const sels = ["h1[data-pl='product-title']", ".product-title-text", ".pdp-comp-title", "[class*='title--wrap'] h1", "[class*='product-title']", "h1.product-title"];
     for (const sel of sels) {
@@ -676,10 +675,6 @@
     };
   }
 
-  // ═══════════════════════════════════════════════════════
-  // IMAGES
-  // ═══════════════════════════════════════════════════════
-
   const BAD_PATTERNS = ["star", "placeholder", "loading", "default", "empty", "blank", "no-image", "noimage", "grey", "gray", "spacer", "pixel", "transparent", "1x1"];
 
   function isBadImage(src) {
@@ -710,10 +705,6 @@
     }
     return "";
   }
-
-  // ═══════════════════════════════════════════════════════
-  // AUTO-SCROLL / WAIT
-  // ═══════════════════════════════════════════════════════
 
   async function autoScroll() {
     const originalY = window.scrollY;
@@ -759,10 +750,6 @@
     return false;
   }
 
-  // ═══════════════════════════════════════════════════════
-  // KEYWORDS
-  // ═══════════════════════════════════════════════════════
-
   const STOP_WORDS = new Set([
     "for","with","and","the","a","an","of","to","in","on","at","by","is","original","new","hot","sale","free","shipping","best","top","quality","high","wholesale","dropshipping","factory","brand","genuine","fast","delivery","1pc","2pcs","3pcs","pcs","set","pack","style","type","you","your","this","that","from","into","only","more","all","any","good","great","item","product","pieces","piece",
     "من","في","على","إلى","مع","عن","هذا","هذه","ذلك","التي","الذي","أو","و","ثم","لكن","حتى","بعد","قبل","كل","بعض","أي","لا","ما","هو","هي","كان","يكون","جدا","أكثر","أقل","جديد","جديدة","الأصلي","الأصلية","الآن","اليوم","سعر","أسعار","شحن","مجاني","مجانا","بيع","شراء","منتج","منتجات","عالية","جودة","أفضل","أحسن","رخيص","حديث","حديثة","متطور","متطورة","قابل","قابلة",
@@ -786,10 +773,6 @@
     for (const k of kw) if (set.has(k)) m++;
     return m;
   }
-
-  // ═══════════════════════════════════════════════════════
-  // CARD SCRAPING
-  // ═══════════════════════════════════════════════════════
 
   function extractPriceInfoFromCard(card) {
     const txt = card.innerText || "";
@@ -883,10 +866,6 @@
     return null;
   }
 
-  // ═══════════════════════════════════════════════════════
-  // STRICT SCRAPER
-  // ═══════════════════════════════════════════════════════
-
   function collectCandidates(currentKeywords, currentModels, currentBrands, currentSpecs, cp) {
     const results = [];
     const seen = new Set();
@@ -974,10 +953,6 @@
     return scored.slice(0, 50);
   }
 
-  // ═══════════════════════════════════════════════════════
-  // API SEARCH
-  // ═══════════════════════════════════════════════════════
-
   async function apiSearch(keyword) {
     const res = await fetch(`${WORKER_URL}/api/search`, {
       method: "POST",
@@ -993,7 +968,6 @@
       const oldP = parseFloat(p.target_original_price || p.original_price || 0);
       const discount = oldP > price && price > 0 ? Math.round((1 - price / oldP) * 100) : 0;
       const rating = parseFloat(String(p.evaluate_rate || "0").replace("%", "")) / 20;
-
       return {
         store: p.shop_name || "AliExpress Seller",
         img: p.product_main_image_url || "",
@@ -1008,10 +982,6 @@
       };
     }).filter(s => s.price > 0 && s.img);
   }
-
-  // ═══════════════════════════════════════════════════════
-  // BUILD SELLER LIST
-  // ═══════════════════════════════════════════════════════
 
   async function buildSellerList(product, forceRescan = false) {
     if (!forceRescan) {
@@ -1061,12 +1031,6 @@
         if (strict.length >= 1) {
           const enriched = strict.map(it => ({ ...it, matchCount: countMatches(it.title || it.store, currentKeywords) }));
           saveCache(product, enriched, "api");
-
-          // ⭐ اجلب الشحن في الخلفية (لا ينتظر المستخدم)
-          enrichWithShipping(enriched).then(() => {
-            try { saveCache(product, enriched, "api"); } catch (_) {}
-          }).catch(() => {});
-
           return { source: "api", sellers: enriched };
         }
       } catch (e) { console.warn(e); }
@@ -1074,10 +1038,6 @@
 
     return { source: "none", sellers: [] };
   }
-
-  // ═══════════════════════════════════════════════════════
-  // PANEL
-  // ═══════════════════════════════════════════════════════
 
   function buildPanel() {
     try {
@@ -1164,6 +1124,8 @@
           updateSourceLabel();
           renderList();
           isScanning = false;
+          // ⭐ حدّث الأسعار والشحن في الخلفية حتى من Cache
+          fetchRealPricesBatch(sellers).catch(() => {});
           return;
         }
       }
@@ -1175,6 +1137,14 @@
       renderList();
 
       if (sellers.length > 0) sendSimilarToDB(currentProduct.url, sellers);
+
+      // ⭐ اطلب الأسعار + الشحن من HTML لكل المصادر
+      if (sellers.length > 0) {
+        console.log(`[Smart Shopper] 🔄 تحديث الأسعار + الشحن لـ ${sellers.length} منتج...`);
+        fetchRealPricesBatch(sellers).then(() => {
+          try { saveCache(currentProduct, sellers, dataSource); } catch (_) {}
+        }).catch(() => {});
+      }
     } catch (e) {
       console.error("[Smart Shopper] Scan failed:", e);
       sellers = [];
@@ -1267,7 +1237,6 @@
       const soldHtml = s.sold > 0 ? `<span class="ss-sold">${fmt(s.sold)} ${T("sold")}</span>` : "";
       const metaItems = [ratingHtml, soldHtml].filter(Boolean).join('<span class="ss-sep">·</span>');
       const saveStr = pricePercent > 0 ? `−${pricePercent}%` : (pricePercent < 0 ? `+${Math.abs(pricePercent)}%` : "");
-      const realBadge = s._realPrice ? `<span class="ss-real-price" title="سعر حقيقي">✓</span>` : "";
 
       let shippingLineHtml = "";
       if (s.shippingPrice === 0) {
@@ -1288,7 +1257,6 @@
           <div class="ss-price-col">
             <div class="ss-price-line">
               <span class="ss-price-now">${formatPrice(s.price, currentProduct?.currency)}</span>
-              ${realBadge}
               ${discountBadge}
             </div>
             ${shippingLineHtml}
@@ -1307,10 +1275,6 @@
       });
     });
   }
-
-  // ═══════════════════════════════════════════════════════
-  // DRAG
-  // ═══════════════════════════════════════════════════════
 
   function makeDraggable(panel) {
     const header = panel.querySelector(".ss-header");
@@ -1351,10 +1315,6 @@
     } catch (_) {}
   }
 
-  // ═══════════════════════════════════════════════════════
-  // HELPERS
-  // ═══════════════════════════════════════════════════════
-
   function valueScore(s) {
     const cp = currentProduct?.price || 0;
     const priceScore = cp ? (cp - s.price) / cp : 0;
@@ -1377,10 +1337,6 @@
   const esc = (s) => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
   const fmt = (n) => n >= 1000 ? (n / 1000).toFixed(1).replace(".0", "") + "k" : n;
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-  // ═══════════════════════════════════════════════════════
-  // MAIN
-  // ═══════════════════════════════════════════════════════
 
   async function run() {
     await sleep(1500);
@@ -1435,5 +1391,5 @@
   }).observe(document, { subtree: true, childList: true });
 
   run();
-  console.log(`[Smart Shopper] v37 ready.`);
+  console.log(`[Smart Shopper] v40 ready.`);
 })();
